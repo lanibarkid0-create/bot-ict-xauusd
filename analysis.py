@@ -21,43 +21,48 @@ SL_BUFFER = 0.2
 
 # Twelve Data symbol mapping untuk berbagai pair
 SYMBOL_MAP = {
-    # Forex majors & crosses
+    # Forex majors
     "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "AUDUSD": "AUD/USD", "NZDUSD": "NZD/USD",
     "USDJPY": "USD/JPY", "USDCHF": "USD/CHF", "USDCAD": "USD/CAD",
+    # Forex crosses
     "EURJPY": "EUR/JPY", "GBPJPY": "GBP/JPY", "AUDJPY": "AUD/JPY", "NZDJPY": "NZD/JPY",
-    "EURGBP": "EUR/GBP", "EURAUD": "EUR/AUD", "GBPAUD": "GBP/AUD", "GBPCAD": "GBP/CAD",
-    "AUDCAD": "AUD/CAD", "AUDNZD": "AUD/NZD", "CADJPY": "CAD/JPY", "CHFJPY": "CHF/JPY",
-    "EURNZD": "EUR/NZD", "GBPNZD": "GBP/NZD",
+    "CADJPY": "CAD/JPY", "CHFJPY": "CHF/JPY",
+    "EURGBP": "EUR/GBP", "EURAUD": "EUR/AUD", "EURCHF": "EUR/CHF", "EURCAD": "EUR/CAD",
+    "GBPAUD": "GBP/AUD", "GBPCAD": "GBP/CAD", "GBPCHF": "GBP/CHF", "GBPNZD": "GBP/NZD",
+    "AUDCAD": "AUD/CAD", "AUDCHF": "AUD/CHF", "AUDNZD": "AUD/NZD",
+    "CADCHF": "CAD/CHF", "NZDCAD": "NZD/CAD", "NZDCHF": "NZD/CHF",
+    "EURNZD": "EUR/NZD",
     # Metals
     "XAUUSD": "XAU/USD", "XAU": "XAU/USD", "GOLD": "XAU/USD",
     "XAGUSD": "XAG/USD", "XAG": "XAG/USD", "SILVER": "XAG/USD",
     # Oil/Energy
     "XTIUSD": "CL", "XTI": "CL", "OIL": "CL", "WTI": "CL", "CL": "CL",
     "XBRUSD": "XBR/USD", "XBR": "XBR/USD", "BRENT": "XBR/USD",
-    # Indices (free tier Twelve Data: limited - SPX, NDX butuh paid)
-    # Untuk free tier, hanya forex, XAU, XAG, CL (oil)
+    # Indices (NDX/NASDAQ, US30 butuh plan upgrade, tetap di-mapping)
+    "NAS100": "NDX", "US100": "NDX", "NASDAQ": "NDX", "NDX": "NDX",
+    "US30": "DJI", "DJ30": "DJI", "DOW": "DJI", "DJI": "DJI",
     "SPX500": "SPX", "SP500": "SPX", "US500": "SPX", "SPX": "SPX",
     "GER40": "DAX", "DE40": "DAX", "DAX": "DAX",
     "UK100": "UKX", "FTSE": "UKX", "UKX": "UKX",
     "JPN225": "JPX", "JP225": "JPX", "NIKKEI": "JPX", "JPX": "JPX",
-    # Note: NAS100/NDX, US30/DJI butuh plan upgrade, tetap di-mapping
-    # supaya bot tidak crash, tapi akan return error friendly
-    "NAS100": "NDX", "US100": "NDX", "NASDAQ": "NDX", "NDX": "NDX",
-    "US30": "DJI", "DJ30": "DJI", "DOW": "DJI", "DJI": "DJI",
 }
 
-# Timeframe mapping
+# Timeframe mapping (Twelve Data supported: 1min, 5min, 15min, 30min, 45min, 1h, 2h, 4h, 8h, 1day, 1week, 1month)
 TF_MAP = {
-    "M1": "1min", "M3": "3min", "M5": "5min", "M15": "15min", "M30": "30min",
-    "H1": "1h", "H2": "2h", "H4": "4h",
+    "M1": "1min", "M5": "5min", "M15": "15min", "M30": "30min", "M45": "45min",
+    "H1": "1h", "H2": "2h", "H4": "4h", "H8": "8h",
     "D1": "1day", "W1": "1week", "MN": "1month",
 }
 
 # Number of bars lookback by timeframe (untuk swing detection)
 TF_LOOKBACK = {
-    "1min": 200, "3min": 200, "5min": 200, "15min": 200, "30min": 200,
-    "1h": 200, "2h": 200, "4h": 200, "1day": 200, "1week": 200, "1month": 200,
+    "1min": 250, "5min": 250, "15min": 250, "30min": 250, "45min": 250,
+    "1h": 250, "2h": 250, "4h": 250, "8h": 250,
+    "1day": 250, "1week": 250, "1month": 250,
 }
+
+# Daftar TF untuk regex & help (Twelve Data supported)
+SUPPORTED_TF = ["M1", "M5", "M15", "M30", "M45", "H1", "H2", "H4", "H8", "D1", "W1", "MN"]
 
 
 def parse_user_input(text: str) -> tuple[str, str] | None:
@@ -65,8 +70,9 @@ def parse_user_input(text: str) -> tuple[str, str] | None:
     Returns (symbol, timeframe) atau None kalau invalid.
     """
     text = text.strip().upper()
+    tf_pattern = "|".join(SUPPORTED_TF)
     # Match pattern: SYMBOL [TF]. Symbol bisa alphanumeric (NAS100, XAUUSD, XTIUSD)
-    m = re.match(r"^([A-Z][A-Z0-9]{2,7})(?:\s+(M1|M3|M5|M15|M30|H1|H2|H4|D1|W1|MN))?$", text)
+    m = re.match(rf"^([A-Z][A-Z0-9]{{2,7}})(?:\s+({tf_pattern}))?$", text)
     if not m:
         return None
     sym = m.group(1)
