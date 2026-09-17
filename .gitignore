@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+
+# log & pid runtime bot
+bot.out.log
+bot.err.log
+bot.pid
+bot.lock
