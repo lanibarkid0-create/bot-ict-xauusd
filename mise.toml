@@ -1,0 +1,5 @@
+[tools]
+python = "3.12.3"
+
+[tool.mise.settings]
+disable_github_attestations = true
