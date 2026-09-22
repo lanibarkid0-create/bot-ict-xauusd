@@ -2096,25 +2096,27 @@ def get_gold_all_in_one(mode: str = "m5") -> dict[str, Any]:
     """Analisa lengkap satu mode: core sinyal + SMC + Vibe + Fincept + AutoHedge + zona FUSION.
 
     mode: "m5" (scalping M5/M15, M1 jika tersedia), "intraday" (H1->M15), "swing" (D1->H1).
-    Sekarang menggunakan unified_analysis.py untuk multi-timeframe + SATU entry zone konfluensi.
+        Sekarang menggunakan unified_analysis.py untuk multi-timeframe + SATU entry zone konfluensi.
     """
     import unified_analysis
     m = _normalize_all_in_one_mode(mode)
+    # Map mode name ke unified_analysis (m5 -> scalp, intraday -> intraday, swing -> swing)
+    ua_mode = {"m5": "scalp", "intraday": "intraday", "swing": "swing"}.get(m, m)
 
     # Fetch market data multi-timeframe
     spot0 = _clean(fetch_gold_price_raw())["price"]
     hist: dict[str, list[dict[str, Any]]] = {}
     # HTF data
     htf_tf = {
-        "m5": "M15",
+        "scalp": "M15",
         "intraday": "H1",
         "swing": "D1",
-    }[m]
+    }[ua_mode]
     ltf_tf = {
-        "m5": "M5",
+        "scalp": "M5",
         "intraday": "M5",
         "swing": "H1",
-    }[m]
+    }[ua_mode]
 
     # Get HTF and LTF history
     if htf_tf in ("H1", "M15"):
@@ -2143,7 +2145,7 @@ def get_gold_all_in_one(mode: str = "m5") -> dict[str, Any]:
 
     # Jalankan unified analysis
     analyzer = unified_analysis.UnifiedAnalyzer()
-    result = analyzer.analyze(m, hist)
+    result = analyzer.analyze(ua_mode, hist)
 
     # Convert UnifiedAnalysisResult ke dict
     def _htf_to_dict(htf: unified_analysis.HTFAnalysis) -> dict:
