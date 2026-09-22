@@ -2095,117 +2095,37 @@ def _normalize_all_in_one_mode(mode: str) -> str:
 def get_gold_all_in_one(mode: str = "m5") -> dict[str, Any]:
     """Analisa lengkap satu mode: core sinyal + SMC + Vibe + Fincept + AutoHedge + zona FUSION.
 
-    mode: "m5" (scalping M5/M15, M1 jika tersedia), "intraday" (H1->M15), "swing" (D1->H1).
-    Sekarang menggunakan unified_analysis.py untuk multi-timeframe + SATU entry zone konfluensi.
+    mode: "m5" (scalping M5/M15), "intraday" (H1->M15), "swing" (D1->H1).
     """
-    import unified_analysis
     m = _normalize_all_in_one_mode(mode)
-
-    # Fetch market data multi-timeframe
-    spot0 = _clean(fetch_gold_price_raw())["price"]
-    hist: dict[str, list[dict[str, Any]]] = {}
-    # HTF data
-    htf_tf = {
-        "m5": "M15",
-        "intraday": "H1",
-        "swing": "D1",
-    }[m]
-    ltf_tf = {
-        "m5": "M5",
-        "intraday": "M5",
-        "swing": "H1",
-    }[m]
-
-    # Get HTF and LTF history
-    if htf_tf in ("H1", "M15"):
-        hist[htf_tf] = fetch_intraday_history("60m" if htf_tf == "H1" else "15m")
+    if m == "m5":
+        core = get_gold_scalping_m5_signal()
+        scalp_m15 = get_gold_scalping_signal()
+    elif m == "intraday":
+        core = get_gold_intraday_signal()
+        scalp_m15 = None
     else:
-        hist[htf_tf] = fetch_daily_history()
-
-    if ltf_tf in ("H1", "M15"):
-        hist[ltf_tf] = fetch_intraday_history("60m" if ltf_tf == "H1" else "15m")
-    else:
-        hist[ltf_tf] = fetch_intraday_history("5m")
-
-    # Tambahan M1 untuk scalping jika tersedia
-    try:
-        hist["M1"] = fetch_intraday_history("1m")
-    except Exception:
-        pass  # M1 tidak selalu tersedia
-
-    # Offset semua history ke spot
-    for tf, h in hist.items():
-        off = _spot_offset(spot0, [float(r["close"]) for r in h]) if h else 0.0
-        for r in h:
-            for k in ("open", "high", "low", "close"):
-                if k in r:
-                    r[k] = float(r[k]) + off
-
-    # Jalankan unified analysis
-    analyzer = unified_analysis.UnifiedAnalyzer()
-    result = analyzer.analyze(m, hist)
-
-    # Convert UnifiedAnalysisResult ke dict
-    def _htf_to_dict(htf: unified_analysis.HTFAnalysis) -> dict:
-        return {
-            "timeframe": htf.timeframe,
-            "vibe": htf.vibe,
-            "fincept": htf.fincept,
-            "director": htf.director,
-            "bias": htf.bias,
-            "conviction": htf.conviction,
-        }
-
-    def _ltf_to_dict(ltf: unified_analysis.LTFAnalysis) -> dict:
-        return {
-            "timeframe": ltf.timeframe,
-            "vibe": ltf.vibe,
-            "quant": ltf.quant,
-            "risk": ltf.risk,
-            "execution": ltf.execution,
-            "entry_limit": ltf.entry_limit,
-            "sl": ltf.sl,
-            "tp1": ltf.tp1,
-            "tp2": ltf.tp2,
-            "lot": ltf.lot,
-        }
-
-    return {
-        "mode": m,
-        "spot_price": result.spot,
-        "timestamp": result.timestamp,
-        "direction": result.direction,
-        "entry_limit": result.entry_limit,
-        "stop_loss": result.sl,
-        "take_profit_1": result.tp1,
-        "take_profit_2": result.tp2,
-        "lot": result.lot,
-        "confidence": result.confidence,
-        "confluence_factors": result.confluence_factors,
-        "htf_analysis": _htf_to_dict(result.htf),
-        "ltf_analysis": _ltf_to_dict(result.ltf),
-        "report": result.report,
-        "disclaimer": DISCLAIMER,
-    }
+        core = get_gold_swing_signal()
+        scalp_m15 = None
+    smc = get_gold_smc_analysis()
+    vibe = get_gold_vibe_analysis()
+    fin = get_gold_fincept_analytics()
+    hedge = get_gold_autohedge_plan()
+    fusion = get_gold_fusion_signal()
+    return {"mode": m, "core": core, "scalp_m15": scalp_m15, "smc": smc,
+            "vibe": vibe, "fincept": fin, "hedge": hedge, "fusion": fusion,
+            "spot_price": fusion.get("spot_price")}
 
 
 @mcp.tool()
 def get_gold_all_in_one_html(mode: str = "m5") -> str:
-    """Versi teks all-in-one siap-kirim Telegram (seksi dipisah baris kosong).
-    Sekarang menggunakan unified_analysis report langsung — multi-timeframe + SATU entry zone."""
+    """Versi teks all-in-one siap-kirim Telegram (seksi dipisah baris kosong)."""
     a = get_gold_all_in_one(mode)
-    # Gunakan report dari unified_analysis jika tersedia (lebih terstruktur)
-    if "report" in a:
-        return a["report"]
-
-    # Fallback ke format lama
     m = a["mode"]
     judul = {"m5": "SCALPING M5", "intraday": "INTRADAY", "swing": "SWING"}[m]
-    spot = a.get("spot_price") or 0.0
+    spot = a.get("spot_price")
     header = f"🧭 *ALL-IN-ONE {judul} XAUUSD*\n💵 Spot: ${spot:,.2f}\n"
-    sections: list[str] = [header, "🧬 *ZONA KONFLUENSI (3 repo)*"]
-    fusion_html = get_gold_fusion_signal_html()
-    sections.append(fusion_html)
+    sections: list[str] = [header, "🧬 *ZONA KONFLUENSI (3 repo)*", get_gold_fusion_signal_html()]
     if m == "m5":
         sections.append("⚡ *TRIGGER M5 + ZONA M15*")
         sections.append(get_gold_scalping_m5_signal_html())
@@ -2217,6 +2137,21 @@ def get_gold_all_in_one_html(mode: str = "m5") -> str:
             get_gold_intraday_signal_html() if m == "intraday" else get_gold_swing_signal_html())
         sections.append("🧱 *SMC/ICT*")
         sections.append(get_gold_smc_analysis_html())
+    v = a["vibe"]
+    sections.append(
+        f"🤖 *VIBE-TRADING*: {v['bias']} skor {v['score_0_100']}/100 | "
+        f"EMA {v['ema9']}/{v['ema21']} | RSI {v['rsi14']} | "
+        f"MACD {v['macd']['hist']:+} | backtest {v['backtest']['trades']} trade WR "
+        f"{v['backtest']['winrate_pct']}%")
+    f_ = a["fincept"]
+    sv = f_["sharpe_var"]
+    sections.append(
+        f"🏦 *FINCEPT*: {f_['dcf']['verdict']} (gap {f_['dcf']['gap_pct']}%) | "
+        f"Sharpe {sv['sharpe_daily']} | VaR95 {sv['var95_daily_pct']}% | "
+        f"portofolio emas {f_['portfolio']['w_gold']}")
+    h = a["hedge"]
+    order = h["execution"].get("order", h["execution"].get("reason", "—"))
+    sections.append(f"🐝 *AUTOHEDGE*: {h['director']['strategy']} ({h['director']['conviction']}%) | {order}")
     sections.append(f"⚠️ {DISCLAIMER}")
     return "\n\n".join(sections)
 

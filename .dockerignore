@@ -1,0 +1,16 @@
+# Jangan ikut di-upload saat `railway up`
+.env
+.venv/
+__pycache__/
+*.pyc
+bot.out.log
+bot.err.log
+bot.pid
+bot.lock
+*.bak
+_*
+!.verify_keep
+push_via_api.py
+railway-deploy/
+xauusd-bot/
+*.log
