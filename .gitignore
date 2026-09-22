@@ -1,9 +1,19 @@
 .env
 __pycache__/
 *.pyc
+.venv/
 
 # log & pid runtime bot
 bot.out.log
 bot.err.log
 bot.pid
 bot.lock
+*.bak
+
+# file kerja/sampah sementara (diawali underscore) kecuali test offline
+_*
+!_verify_htf.py
+
+# script yang menyentuh kredensial - JANGAN pernah commit
+push_via_api.py
+

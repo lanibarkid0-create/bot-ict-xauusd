@@ -43,6 +43,7 @@ PRICE_CACHE_TTL = float(os.getenv("GOLD_PRICE_CACHE_TTL", "30"))
 HISTORY_CACHE_TTL = float(os.getenv("GOLD_HISTORY_CACHE_TTL", "600"))
 INTRADAY_CACHE_TTL = float(os.getenv("GOLD_INTRADAY_CACHE_TTL", "180"))
 M5_CACHE_TTL = float(os.getenv("GOLD_M5_CACHE_TTL", "120"))
+H1_CACHE_TTL = float(os.getenv("GOLD_H1_CACHE_TTL", "300"))
 
 # ------------------------------------------------- mode scalping momentum
 # Histori intraday dipakai untuk membaca momentum jangka pendek, per timeframe:
@@ -56,9 +57,13 @@ YAHOO_INTRADAY_URLS: dict[str, tuple[str, ...]] = {
         "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=5m&range=5d",
         "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=5m&range=5d",
     ),
+    "60m": (
+        "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=60m&range=1mo",
+        "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=60m&range=1mo",
+    ),
 }
 # TTL cache per timeframe (detik): M15 lebih lambat berubah, M5 lebih cepat.
-INTRADAY_CACHE_TTLS = {"15m": INTRADAY_CACHE_TTL, "5m": M5_CACHE_TTL}
+INTRADAY_CACHE_TTLS = {"15m": INTRADAY_CACHE_TTL, "5m": M5_CACHE_TTL, "60m": H1_CACHE_TTL}
 # Nilai 1 pip untuk XAUUSD. Default 1 pip = 1.00 poin harga ($1 per troy oz).
 # Broker dengan kuotasi 2 desimal biasanya memakai 0.1 atau 0.01 — sesuaikan
 # lewat env GOLD_PIP_VALUE agar 50 pip = 50 * GOLD_PIP_VALUE poin.
@@ -83,6 +88,24 @@ SCALP_M5_TP2_PIPS = float(os.getenv("GOLD_SCALP_M5_TP2_PIPS", "15"))
 SCALP_M5_MIN_SCORE = float(os.getenv("GOLD_SCALP_M5_MIN_SCORE", "4"))
 # Order M5 cepat basi: default 1,5 jam (bukan 4 jam seperti M15).
 SCALP_M5_VALID_HOURS = float(os.getenv("GOLD_SCALP_M5_VALID_HOURS", "1.5"))
+
+# ------------------------- mode INTRADAY (HTF H1 bias -> LTF M15 zona POI)
+# Cocok untuk tahan 1 sesi (London/New York). Default SL 80 pip, TP1 160 (1:2),
+# TP2 240 (1:3). Entry LIMIT di POI M15 (OB/FVG/EQL) yang selaras bias H1+D1.
+INTRA_SL_PIPS = float(os.getenv("GOLD_INTRA_SL_PIPS", "80"))
+INTRA_TP1_PIPS = float(os.getenv("GOLD_INTRA_TP1_PIPS", "160"))
+INTRA_TP2_PIPS = float(os.getenv("GOLD_INTRA_TP2_PIPS", "240"))
+INTRA_MIN_SCORE = float(os.getenv("GOLD_INTRA_MIN_SCORE", "4"))
+INTRA_VALID_HOURS = float(os.getenv("GOLD_INTRA_VALID_HOURS", "12"))
+
+# ------------------------- mode SWING (HTF D1 bias -> LTF H1 zona POI)
+# Cocok untuk tahan 2-5 hari. Default SL 200 pip, TP1 400 (1:2), TP2 600 (1:3).
+# Entry LIMIT di POI H1 yang selaras bias D1.
+SWING_SL_PIPS = float(os.getenv("GOLD_SWING_SL_PIPS", "200"))
+SWING_TP1_PIPS = float(os.getenv("GOLD_SWING_TP1_PIPS", "400"))
+SWING_TP2_PIPS = float(os.getenv("GOLD_SWING_TP2_PIPS", "600"))
+SWING_MIN_SCORE = float(os.getenv("GOLD_SWING_MIN_SCORE", "4"))
+SWING_VALID_HOURS = float(os.getenv("GOLD_SWING_VALID_HOURS", "72"))
 
 # ----------------- mode analisa SMC / ICT-style (`/smc`): bias → skenario →
 # pindai order block LTF. Bobot per komponen bisa di-tune lewat env ini.
@@ -210,11 +233,14 @@ def fetch_daily_history() -> list[dict[str, Any]]:
 
 
 def fetch_intraday_history(interval: str = "15m") -> list[dict[str, Any]]:
-    """Ambil OHLC intraday GC=F (5 hari) dari Yahoo (cache → query1 → query2).
+    """Ambil OHLC intraday GC=F (5 hari utk 5m/15m, 1 bln utk 60m/H1).
 
-    interval: "15m" (default) untuk zona/bias, atau "5m" untuk trigger scalping.
+    interval: "15m" (zona intraday), "5m" (trigger), "60m"/"H1" (bias HTF).
     """
     urls = YAHOO_INTRADAY_URLS.get(interval)
+    if urls is None and interval.upper() == "H1":
+        urls = YAHOO_INTRADAY_URLS.get("60m")
+        interval = "60m"
     if urls is None:
         raise ValueError(f"Interval intraday tidak didukung: {interval}")
     ttl = INTRADAY_CACHE_TTLS[interval]
@@ -1436,6 +1462,698 @@ def get_gold_smc_analysis_html() -> str:
         f"🕒 Bar M5: {a['last_bar_m5']}  |  M15: {a['last_bar_m15']}\n\n"
         f"🧠 {a['reason']}\n\n⚠️ {a['disclaimer']}"
     )
+
+
+def _smc_bias_from_series(
+    closes: list[float],
+    opens: list[float],
+    highs: list[float],
+    lows: list[float],
+    disp: dict[str, Any],
+    struct: dict[str, Any] | None = None,
+    htf: str = "",
+    label: str = "",
+) -> tuple[str, dict[str, float]]:
+    """Skor bias generik: EMA9/21 + RSI14 + momentum 3-bar + struktur + HTF + disp."""
+    ema9 = _ema(closes, 9)
+    ema21 = _ema(closes, 21)
+    mom = closes[-1] - closes[-4] if len(closes) >= 4 else 0.0
+    rsi = _rsi(closes)
+    skor_buy, skor_sell = 0.0, 0.0
+    if htf == "NAIK":
+        skor_buy += SMC_BIAS_W_HTF
+    elif htf == "TURUN":
+        skor_sell += SMC_BIAS_W_HTF
+    if mom > 0:
+        skor_buy += SMC_BIAS_W_MOM
+    elif mom < 0:
+        skor_sell += SMC_BIAS_W_MOM
+    if ema9 > ema21:
+        skor_buy += 1
+    elif ema9 < ema21:
+        skor_sell += 1
+    if closes[-1] > ema21:
+        skor_buy += 1
+    elif closes[-1] < ema21:
+        skor_sell += 1
+    if struct:
+        if struct.get("bos_up") or struct.get("choch_up"):
+            skor_buy += SMC_BIAS_W_STRUCT
+        if struct.get("bos_down") or struct.get("choch_down"):
+            skor_sell += SMC_BIAS_W_STRUCT
+    if disp.get("impulse"):
+        if disp.get("arah") == "UP":
+            skor_buy += SMC_BIAS_W_DISP
+        elif disp.get("arah") == "DOWN":
+            skor_sell += SMC_BIAS_W_DISP
+    if rsi >= 55:
+        skor_buy += 1
+    elif rsi <= 45:
+        skor_sell += 1
+    bias = "BUY" if skor_buy > skor_sell else ("SELL" if skor_sell > skor_buy else "NETRAL")
+    return bias, {"BUY": skor_buy, "SELL": skor_sell}
+
+
+def _ltf_features(
+    lo: list[float], lh: list[float], ll: list[float], lc: list[float],
+) -> dict[str, Any]:
+    """Hitung OB/FVG/EQ/sweep/indikator LTF sekali pakai (bagian 1 mesin)."""
+    disp_l = _displacement(lo, lc, lh, ll)
+    sh_l, sl_l = _swing_points(lh, ll)
+    atr_l = _atr(lh, ll)
+    ob_bull, ob_bear = _scan_order_blocks(lo, lh, ll, lc, atr_l)
+    fvg_up: list[dict[str, Any]] = []
+    fvg_dn: list[dict[str, Any]] = []
+    for i in range(max(2, len(lc) - 40), len(lc)):
+        hi_prev = max(lo[i - 1], lc[i - 1])
+        lo_prev = min(lo[i - 1], lc[i - 1])
+        if min(lo[i], lc[i]) > hi_prev and (lc[i] - lc[i - 1]) > 0:
+            fvg_up.append({"bawah": round(hi_prev, 2), "atas": round(min(lo[i], lc[i]), 2)})
+        if max(lo[i], lc[i]) < lo_prev and (lc[i] - lc[i - 1]) < 0:
+            fvg_dn.append({"bawah": round(max(lo[i], lc[i]), 2), "atas": round(lo_prev, 2)})
+    tol_eq = max(atr_l * 0.15, 1e-9)
+    eq_h = [lh[i] for i in sh_l[-4:] if any(abs(lh[i] - lh[j]) <= tol_eq for j in sh_l[-4:] if j != i)]
+    eq_l = [ll[i] for i in sl_l[-4:] if any(abs(ll[i] - ll[j]) <= tol_eq for j in sl_l[-4:] if j != i)]
+    sw_up = bool(sh_l) and lh[-1] > lh[sh_l[-1]] and lc[-1] <= lh[sh_l[-1]]
+    sw_dn = bool(sl_l) and ll[-1] < ll[sl_l[-1]] and lc[-1] >= ll[sl_l[-1]]
+    return {"disp": disp_l, "sh": sh_l, "sl": sl_l, "atr": atr_l,
+            "ob_bull": ob_bull, "ob_bear": ob_bear,
+            "fvg_up": fvg_up[-4:], "fvg_dn": fvg_dn[-4:],
+            "eq_h": eq_h, "eq_l": eq_l, "sw_up": sw_up, "sw_dn": sw_dn,
+            "ema9": _ema(lc, 9), "ema21": _ema(lc, 21), "rsi": _rsi(lc),
+            "mom": lc[-1] - lc[-4] if len(lc) >= 4 else 0.0}
+
+
+def _score_ltf(
+    bias: str, f: dict[str, Any]
+) -> tuple[int, int, list[str]]:
+    """Skor confluence LTF 0-6 (bagian 2 mesin)."""
+    skor, maxi, cat = 0, 6, []
+    if bias in ("BUY", "SELL"):
+        obs = [o for o in (f["ob_bull"] if bias == "BUY" else f["ob_bear"]) if o["status"] == "fresh"]
+        if obs:
+            skor += 1
+            cat.append(f"OB fresh selaras {bias} ({len(obs)})")
+        fvgs = f["fvg_up"] if bias == "BUY" else f["fvg_dn"]
+        if fvgs:
+            skor += 1
+            cat.append(f"FVG selaras {bias} ({len(fvgs)})")
+    ema_ok = (bias == "BUY" and f["ema9"] > f["ema21"]) or (bias == "SELL" and f["ema9"] < f["ema21"])
+    if ema_ok:
+        skor += 1
+        cat.append(f"EMA9 {f['ema9']} vs EMA21 {f['ema21']} searah {bias}")
+    rsi_ok = (bias == "BUY" and f["rsi"] >= 50) or (bias == "SELL" and f["rsi"] <= 50)
+    if rsi_ok:
+        skor += 1
+        cat.append(f"RSI14 {f['rsi']} mendukung {bias}")
+    mom_ok = (bias == "BUY" and f["mom"] > 0) or (bias == "SELL" and f["mom"] < 0)
+    if mom_ok:
+        skor += 1
+        cat.append(f"momentum 3-bar {f['mom']:+} searah {bias}")
+    if f["disp"].get("impulse") and f["disp"].get("arah") == ("UP" if bias == "BUY" else "DOWN"):
+        skor += 1
+        cat.append(f"displacement {f['disp']['arah']} ({f['disp']['ratio']})")
+    return skor, maxi, cat
+
+
+def _build_htf_ltf_result(
+    *,
+    mode: str, htf_label: str, ltf_label: str, spot: float,
+    bias: str, bias_skor: dict[str, float], f: dict[str, Any],
+    skor: int, maxi: int, catatan: list[str],
+    poi: dict[str, Any], sl_p: float, tp1_p: float, tp2_p: float,
+    min_score: float, valid_h: float, pip: float,
+    ll: list[float], lh: list[float], ltf_bar: str,
+    disp_h: dict[str, Any], struct_h: dict[str, Any] | None, htf_trend: str,
+) -> dict[str, Any]:
+    """Rakit dict hasil + SL/TP + narasi (bagian 3 mesin)."""
+    atr_l = f["atr"]
+    vol_pct = round(atr_l / spot * 100, 3) if spot else 0.0
+    vol_ok = 0.05 <= vol_pct <= 1.5
+    arah = "TUNGGU"
+    if bias in ("BUY", "SELL") and skor >= min_score and vol_ok and poi["skor_zona"] > 0:
+        arah = bias
+        mid = round((poi["bawah"] + poi["atas"]) / 2, 2)
+        if mode == "intraday" and poi["bawah"] <= spot <= poi["atas"]:
+            entry = mid
+        elif mode == "intraday":
+            entry = round(min(poi["atas"], spot - 0.10 * atr_l), 2) if bias == "BUY" else round(max(poi["bawah"], spot + 0.10 * atr_l), 2)
+        else:
+            entry = mid
+    else:
+        entry = round((poi["bawah"] + poi["atas"]) / 2, 2) if poi["skor_zona"] > 0 else round(spot, 2)
+    sd, t1d, t2d = sl_p * pip, tp1_p * pip, tp2_p * pip
+    if arah == "BUY":
+        sl, tp1, tp2 = round(entry - sd, 2), round(entry + t1d, 2), round(entry + t2d, 2)
+    elif arah == "SELL":
+        sl, tp1, tp2 = round(entry + sd, 2), round(entry - t1d, 2), round(entry - t2d, 2)
+    else:
+        sl, tp1, tp2 = round(spot - sd, 2), round(spot + t1d, 2), round(spot + t2d, 2)
+    label = "TINGGI" if skor >= 5 else ("SEDANG-TINGGI" if skor >= min_score else ("RENDAH (tunggu konfirmasi)" if skor >= 3 else "SANGAT RENDAH (hindari entry)"))
+    jarak = round(abs(entry - spot), 2)
+    if arah == "TUNGGU":
+        if bias not in ("BUY", "SELL"):
+            alasan = (f"Bias {htf_label} NETRAL ({bias_skor['BUY']:g} vs {bias_skor['SELL']:g}) → jangan entry. "
+                      f"Tunggu BOS/CHOCH {htf_label} + displacement memperjelas arah.")
+        elif not vol_ok:
+            alasan = (f"Volatilitas {ltf_label} tidak wajar (ATR {atr_l} = {vol_pct}% harga, syarat 0,05%-1,5%) → dibatalkan.")
+        elif poi["skor_zona"] <= 0:
+            alasan = (f"Tidak ada POI {ltf_label} valid selaras {bias} → TUNGGU. "
+                      f"Tidak ada zona yang 'pasti' didatangi — tunggu sweep+displacement membentuk OB/FVG baru.")
+        else:
+            alasan = (f"Skor {skor}/{maxi} < ambang {min_score:g} → belum layak {bias}. "
+                      f"Zona {poi['jenis']} {poi['bawah']:,.2f}-{poi['atas']:,.2f}; tunggu konfirmasi {ltf_label}.")
+    else:
+        alasan = (f"Bias {htf_label} {bias} ({bias_skor['BUY']:g} vs {bias_skor['SELL']:g}) + "
+                  f"zona {poi['jenis']} {ltf_label} {poi['bawah']:,.2f}-{poi['atas']:,.2f} ({poi['status']}). "
+                  f"Skor {skor}/{maxi} ≥ {min_score:g} → {arah} LIMIT {entry:,.2f} "
+                  f"({jarak:.2f} poin dari spot); SL {sd:.2f}, TP1 {t1d:.2f}.")
+    valid_until = (datetime.now(timezone.utc) + timedelta(hours=valid_h)).astimezone(WIB)
+    return {
+        "symbol": "XAUUSD", "mode": mode, "timeframe_htf": htf_label, "timeframe_ltf": ltf_label,
+        "spot_price": spot, "direction": arah, "bias": bias, "bias_score": bias_skor,
+        "order_type": "LIMIT" if arah != "TUNGGU" else "WAIT",
+        "entry_limit": entry, "entry_market": spot, "entry_distance_points": jarak,
+        "zona_poi": {"jenis": poi["jenis"], "bawah": poi["bawah"], "atas": poi["atas"],
+                     "status": poi["status"], "skor_zona": poi["skor_zona"],
+                     "jarak_atr": round(poi["jarak_atr"], 2)},
+        "stop_loss": sl, "take_profit_1": tp1, "take_profit_2": tp2,
+        "sl_pips": sl_p, "tp1_pips": tp1_p, "tp2_pips": tp2_p, "pip_value": pip,
+        "risk_points": sd, "reward_points_tp1": t1d, "reward_points_tp2": t2d,
+        "risk_reward_tp1": f"1:{tp1_p / sl_p:.2f}", "risk_reward_tp2": f"1:{tp2_p / sl_p:.2f}",
+        "probability_score": f"{skor}/{maxi}", "probability_label": label,
+        "min_score_required": min_score, "volatility_ok": vol_ok,
+        "atr_ltf": atr_l, "atr_pct": vol_pct, "confluences": catatan,
+        "ema9_ltf": f["ema9"], "ema21_ltf": f["ema21"], "rsi14_ltf": f["rsi"],
+        "momentum_3bar_ltf": f["mom"], "displacement_ltf": f["disp"],
+        "displacement_htf": disp_h, "struktur_htf": struct_h,
+        "equal_highs_ltf": [round(x, 2) for x in f["eq_h"][-4:]],
+        "equal_lows_ltf": [round(x, 2) for x in f["eq_l"][-4:]],
+        "sweep": {"atas": f["sw_up"], "bawah": f["sw_dn"]},
+        "last_bar_ltf": ltf_bar, "tren_htf_detail": htf_trend,
+        "valid_until": valid_until.strftime("%Y-%m-%d %H:%M WIB"),
+        "reason": alasan,
+        "disclaimer": "Edukasi/analisis teknis sederhana, bukan saran keuangan.",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _spot_offset(spot: float, closes: list[float]) -> float:
+    """Offset penyelarasan seri futures (GC=F) ke harga spot: spot - close terakhir."""
+    return round(float(spot) - float(closes[-1]), 2) if closes else 0.0
+
+
+def _market_structure(
+    highs: list[float], lows: list[float], closes: list[float],
+    sh: list[int], sl: list[int],
+) -> dict[str, bool]:
+    """Deteksi BOS/CHOCH sederhana dari swing points HTF (bagian mesin)."""
+    out = {"bos_up": False, "bos_down": False, "choch_up": False, "choch_down": False}
+    if not closes:
+        return out
+    last_sh = highs[sh[-1]] if sh else None
+    prev_sh = highs[sh[-2]] if len(sh) >= 2 else None
+    last_sl = lows[sl[-1]] if sl else None
+    prev_sl = lows[sl[-2]] if len(sl) >= 2 else None
+    c = closes[-1]
+    if last_sh is not None and c > last_sh:
+        out["bos_up"] = True
+    if last_sl is not None and c < last_sl:
+        out["bos_down"] = True
+    # CHOCH: break terjadi melawan struktur sebelumnya (high sebelumnya lebih
+    # tinggi berarti struktur lama turun -> break up = change of character).
+    if out["bos_up"] and prev_sh is not None and prev_sh > last_sh:
+        out["choch_up"] = True
+    if out["bos_down"] and prev_sl is not None and prev_sl < last_sl:
+        out["choch_down"] = True
+    return out
+
+
+def _pick_best_poi(
+    bias: str,
+    ob_bull: list[dict[str, Any]], ob_bear: list[dict[str, Any]],
+    fvg_up: list[dict[str, Any]], fvg_dn: list[dict[str, Any]],
+    eq_h: list[float], eq_l: list[float],
+    spot: float, ll: list[float], lh: list[float], atr: float,
+) -> dict[str, Any]:
+    """Pilih satu zona POI LTF terbaik selaras bias (bagian mesin HTF->LTF).
+
+    Prioritas skor: OB fresh (3) > FVG (2) > zona likuiditas EQ (1);
+    pada skor sama, ambil yang terdekat dari spot. Zona harus masuk akal
+    sebagai area limit: BUY dicari di bawah/di sekitar harga, SELL di atas.
+    """
+    atr_s = max(float(atr or 0.0), 0.1)
+    kosong = {"jenis": "-", "bawah": round(spot, 2), "atas": round(spot, 2),
+              "status": "tidak ada", "skor_zona": 0, "jarak_atr": 0.0}
+    kandidat: list[dict[str, Any]] = []
+    if bias == "BUY":
+        for z in ob_bull:
+            kandidat.append({"jenis": "Order Block bullish", "bawah": z["bawah"], "atas": z["atas"],
+                             "status": z["status"], "skor_zona": 3 if z["status"] == "fresh" else 1})
+        for z in fvg_up:
+            kandidat.append({"jenis": "FVG bullish (imbalance)", "bawah": z["bawah"], "atas": z["atas"],
+                             "status": "fresh", "skor_zona": 2})
+        if eq_l:
+            lvl = round(min(eq_l), 2)
+            kandidat.append({"jenis": "Equal Lows (likuiditas)", "bawah": round(lvl - atr_s * 0.25, 2),
+                             "atas": lvl, "status": "likuiditas", "skor_zona": 1})
+        # BUY limit wajar di bawah harga (discount); toleransi sedikit di atas.
+        valid = [k for k in kandidat if k["atas"] <= spot + atr_s * 0.5] or kandidat
+    elif bias == "SELL":
+        for z in ob_bear:
+            kandidat.append({"jenis": "Order Block bearish", "bawah": z["bawah"], "atas": z["atas"],
+                             "status": z["status"], "skor_zona": 3 if z["status"] == "fresh" else 1})
+        for z in fvg_dn:
+            kandidat.append({"jenis": "FVG bearish (imbalance)", "bawah": z["bawah"], "atas": z["atas"],
+                             "status": "fresh", "skor_zona": 2})
+        if eq_h:
+            lvl = round(max(eq_h), 2)
+            kandidat.append({"jenis": "Equal Highs (likuiditas)", "bawah": lvl,
+                             "atas": round(lvl + atr_s * 0.25, 2), "status": "likuiditas", "skor_zona": 1})
+        valid = [k for k in kandidat if k["bawah"] >= spot - atr_s * 0.5] or kandidat
+    else:
+        return kosong
+    if not valid:
+        return kosong
+
+    def jarak_tengah(k: dict[str, Any]) -> float:
+        return abs(spot - (k["bawah"] + k["atas"]) / 2)
+
+    terbaik = dict(min(valid, key=lambda k: (-k["skor_zona"], jarak_tengah(k))))
+    terbaik["jarak_atr"] = round(jarak_tengah(terbaik) / atr_s, 2)
+    return terbaik
+
+
+# ============================================================ engine HTF->LTF
+# Dipakai /intraday (H1 bias -> M15 POI) dan /swing (D1 bias -> H1 POI).
+# ============================================================ engine HTF->LTF
+# Dipakai /m5 (M15 bias -> M5 POI), /intraday (H1 bias -> M15 POI),
+# dan /swing (D1 bias -> H1 POI).
+# Prinsip: HTF menentukan arah (jangan lawan), LTF menentukan DI MANA entry
+
+
+@mcp.tool()
+def get_gold_intraday_signal() -> dict[str, Any]:
+    """Sinyal INTRADAY XAUUSD: bias H1 (+tren D1) -> entry LIMIT di POI M15."""
+    spot0 = _clean(fetch_gold_price_raw())["price"]
+    h1 = fetch_intraday_history("60m")
+    m15 = fetch_intraday_history("15m")
+    ho = [float(r["open"]) for r in h1]
+    hh = [float(r["high"]) for r in h1]
+    hl = [float(r["low"]) for r in h1]
+    hc = [float(r["close"]) for r in h1]
+    lo = [float(r["open"]) for r in m15]
+    lh = [float(r["high"]) for r in m15]
+    ll = [float(r["low"]) for r in m15]
+    lc = [float(r["close"]) for r in m15]
+    off15 = _spot_offset(spot0, lc)
+    ho = [x + off15 for x in ho]
+    hh = [x + off15 for x in hh]
+    hl = [x + off15 for x in hl]
+    hc = [x + off15 for x in hc]
+    lo = [x + off15 for x in lo]
+    lh = [x + off15 for x in lh]
+    ll = [x + off15 for x in ll]
+    lc = [x + off15 for x in lc]
+    spot = lc[-1]
+    dly = fetch_daily_history()
+    dc = [float(r["close"]) for r in dly]
+    offd = _spot_offset(spot, dc)
+    dc = [x + offd for x in dc]
+    trend = "NAIK" if _sma(dc, 5) > _sma(dc, 20) else ("TURUN" if _sma(dc, 5) < _sma(dc, 20) else "RATA")
+    disp_h = _displacement(ho, hc, hh, hl)
+    sh_h, sl_h = _swing_points(hh, hl)
+    struct_h = _market_structure(hh, hl, hc, sh_h, sl_h)
+    bias, bskor = _smc_bias_from_series(hc, ho, hh, hl, disp_h, struct_h, trend)
+    f = _ltf_features(lo, lh, ll, lc)
+    skor, maxi, cat = _score_ltf(bias, f)
+    poi = _pick_best_poi(bias, f["ob_bull"], f["ob_bear"], f["fvg_up"], f["fvg_dn"], f["eq_h"], f["eq_l"], spot, ll, lh, f["atr"])
+    pip = PIP_VALUE if PIP_VALUE > 0 else 1.0
+    return _build_htf_ltf_result(
+        mode="intraday", htf_label="H1", ltf_label="M15", spot=spot,
+        bias=bias, bias_skor=bskor, f=f, skor=skor, maxi=maxi, catatan=cat,
+        poi=poi, sl_p=INTRA_SL_PIPS, tp1_p=INTRA_TP1_PIPS, tp2_p=INTRA_TP2_PIPS,
+        min_score=INTRA_MIN_SCORE, valid_h=INTRA_VALID_HOURS, pip=pip,
+        ll=ll, lh=lh, ltf_bar=m15[-1].get("time", m15[-1]["date"]),
+        disp_h=disp_h, struct_h=struct_h, htf_trend=trend,
+    )
+
+
+def _format_htf_ltf_html(a: dict[str, Any], judul: str, ikon: str) -> str:
+    """Format satu pesan Telegram untuk sinyal HTF->LTF (intraday/swing)."""
+    tunggu = a["direction"] == "TUNGGU"
+    z = a["zona_poi"]
+    header = f"⏳ *{judul} — TUNGGU*\n" if tunggu else f"{ikon} *{judul} ({a['timeframe_htf']} bias → {a['timeframe_ltf']} zona)*\n"
+    arah = f"➡️ Arah: *{a['direction']}*"
+    if not tunggu:
+        arah += (f"  |  Order: *{a['order_type']}*\n🎯 Entry limit: {a['entry_limit']:,.2f}"
+                 f"  ({a['entry_distance_points']:.2f} poin dari spot)")
+    else:
+        arah += f"  |  Bias: {a['bias']}\n🎯 Zona POI: {z['jenis']} {z['bawah']:,.2f}-{z['atas']:,.2f}"
+    zona = (f"📦 Zona POI: *{z['jenis']}* {z['bawah']:,.2f}-{z['atas']:,.2f} "
+            f"({z['status']}, {z['jarak_atr']}x ATR)")
+    conf = "; ".join(a["confluences"]) or "—"
+    return (
+        f"{header}"
+        f"💵 Spot: ${a['spot_price']:,.2f}  |  Bias {a['timeframe_htf']}: {a['bias']} "
+        f"({a['bias_score']['BUY']:g} vs {a['bias_score']['SELL']:g})\n\n"
+        f"{arah}\n"
+        f"{zona}\n"
+        f"🛑 SL: {a['stop_loss']:,.2f}  ({a['sl_pips']:.0f} pip = {a['risk_points']:,.2f} poin)\n"
+        f"🥇 TP1: {a['take_profit_1']:,.2f}  ({a['tp1_pips']:.0f} pip, R:R {a['risk_reward_tp1']})\n"
+        f"🥈 TP2: {a['take_profit_2']:,.2f}  ({a['tp2_pips']:.0f} pip, R:R {a['risk_reward_tp2']})\n"
+        f"📊 Skor: {a['probability_score']} ({a['probability_label']}) | "
+        f"ATR {a['atr_ltf']} ({a['atr_pct']}%)\n"
+        f"📊 {a['timeframe_ltf']} → EMA {a['ema9_ltf']}/{a['ema21_ltf']} | RSI {a['rsi14_ltf']} | "
+        f"mom {a['momentum_3bar_ltf']:+} | disp {a['displacement_ltf']['arah']}/{a['displacement_ltf']['ratio']}\n"
+        f"⏰ Berlaku s/d: {a['valid_until']}  |  Bar: {a['last_bar_ltf']}\n\n"
+        f"🧠 {a['reason']}\nKonfluensi: {conf}\n\n⚠️ {a['disclaimer']}"
+    )
+
+
+@mcp.tool()
+def get_gold_intraday_signal_html() -> str:
+    """Sinyal INTRADAY XAUUSD (H1 -> M15 POI) dalam teks siap-kirim Telegram."""
+    return _format_htf_ltf_html(get_gold_intraday_signal(), "INTRADAY XAUUSD", "📈")
+
+
+@mcp.tool()
+def get_gold_swing_signal() -> dict[str, Any]:
+    """Sinyal SWING XAUUSD: bias D1 -> entry LIMIT di POI H1.
+
+    Zona POI valid = OB fresh > FVG fresh > sweep-reversal.
+    SL 200 pip / TP1 400 / TP2 600 (R:R 1:2/1:3). Tahan 2-5 hari (72 jam).
+    """
+    spot0 = _clean(fetch_gold_price_raw())["price"]
+    dly = fetch_daily_history()
+    h1 = fetch_intraday_history("60m")
+    do = [float(r["open"]) for r in dly]
+    dh = [float(r["high"]) for r in dly]
+    dl = [float(r["low"]) for r in dly]
+    dc = [float(r["close"]) for r in dly]
+    lo = [float(r["open"]) for r in h1]
+    lh = [float(r["high"]) for r in h1]
+    ll = [float(r["low"]) for r in h1]
+    lc = [float(r["close"]) for r in h1]
+    offh = _spot_offset(spot0, lc)
+    for arr in (do, dh, dl, dc, lo, lh, ll, lc):
+        for i in range(len(arr)):
+            arr[i] += offh
+    spot = lc[-1]
+    disp_h = _displacement(do, dc, dh, dl)
+    sh_h, sl_h = _swing_points(dh, dl)
+    struct_h = _market_structure(dh, dl, dc, sh_h, sl_h)
+    sma5, sma20 = _sma(dc, 5), _sma(dc, 20)
+    trend = "NAIK" if sma5 > sma20 else ("TURUN" if sma5 < sma20 else "RATA")
+    bias, bskor = _smc_bias_from_series(dc, do, dh, dl, disp_h, struct_h, trend)
+    f = _ltf_features(lo, lh, ll, lc)
+    skor, maxi, cat = _score_ltf(bias, f)
+    poi = _pick_best_poi(bias, f["ob_bull"], f["ob_bear"], f["fvg_up"], f["fvg_dn"], f["eq_h"], f["eq_l"], spot, ll, lh, f["atr"])
+    pip = PIP_VALUE if PIP_VALUE > 0 else 1.0
+    return _build_htf_ltf_result(
+        mode="swing", htf_label="D1", ltf_label="H1", spot=spot,
+        bias=bias, bias_skor=bskor, f=f, skor=skor, maxi=maxi, catatan=cat,
+        poi=poi, sl_p=SWING_SL_PIPS, tp1_p=SWING_TP1_PIPS, tp2_p=SWING_TP2_PIPS,
+        min_score=SWING_MIN_SCORE, valid_h=SWING_VALID_HOURS, pip=pip,
+        ll=ll, lh=lh, ltf_bar=h1[-1].get("time", h1[-1]["date"]),
+        disp_h=disp_h, struct_h=struct_h, htf_trend=trend,
+    )
+
+
+@mcp.tool()
+def get_gold_swing_signal_html() -> str:
+    """Sinyal SWING XAUUSD (D1 -> H1 POI) dalam teks siap-kirim Telegram."""
+    return _format_htf_ltf_html(get_gold_swing_signal(), "SWING XAUUSD", "🌊")
+
+
+# ============================================ integrasi 3 repo
+# Vibe-Trading (HKUDS) -> indikator+backtest | FinceptTerminal -> analitik
+# Sharpe/VaR/DCF/opsi | AutoHedge (Swarm) -> pipeline Director/Quant/Risk/Exec.
+# Modul: vibe_trading.py, fincept_terminal.py, autohedge.py (pure python).
+DISCLAIMER = "Edukasi/analisis teknis sederhana, bukan saran keuangan."
+
+
+def _fusion_inputs() -> tuple[float, list[dict[str, Any]]]:
+    spot = _clean(fetch_gold_price_raw())["price"]
+    dly = fetch_daily_history()
+    dc = [float(r["close"]) for r in dly]
+    off = _spot_offset(spot, dc)
+    adj = []
+    for r in dly:
+        adj.append({"open": float(r["open"]) + off, "high": float(r["high"]) + off,
+                    "low": float(r["low"]) + off, "close": float(r["close"]) + off})
+    return spot, adj
+
+
+@mcp.tool()
+def get_gold_vibe_analysis() -> dict[str, Any]:
+    """Analisa gaya Vibe-Trading: EMA/RSI/MACD/BB + backtest EMA-cross (dict)."""
+    from vibe_trading import vibe_analyze
+    spot, adj = _fusion_inputs()
+    a = vibe_analyze(adj, spot)
+    a["spot_price"] = spot
+    return a
+
+
+@mcp.tool()
+def get_gold_vibe_analysis_html() -> str:
+    """Analisa gaya Vibe-Trading dalam teks siap-kirim Telegram."""
+    a = get_gold_vibe_analysis()
+    b = a["backtest"]
+    al = "\n".join(f"• {r}" for r in a["reasons"])
+    return (
+        f"🤖 *VIBE-TRADING XAUUSD ({a['bias']})*\n"
+        f"💵 Spot: ${a['spot_price']:,.2f}  |  Skor: {a['score_0_100']}/100\n"
+        f"📊 EMA9 {a['ema9']:,.2f} / EMA21 {a['ema21']:,.2f}  |  RSI {a['rsi14']}  |  ATR {a['atr14']}\n"
+        f"📉 MACD {a['macd']['line']} / {a['macd']['signal']} (hist {a['macd']['hist']:+})\n"
+        f"📦 BB {a['bollinger']['lower']:,.2f}-{a['bollinger']['mid']:,.2f}-{a['bollinger']['upper']:,.2f}\n"
+        f"🧪 Backtest: {b['trades']} trade, WR {b['winrate_pct']}%, ekspektasi {b['expectancy_pts']} pts\n"
+        f"{al}\n\n⚠️ {DISCLAIMER}"
+    )
+
+
+@mcp.tool()
+def get_gold_fincept_analytics() -> dict[str, Any]:
+    """Analitik gaya FinceptTerminal: Sharpe/VaR/DCF/opsi/obligasi/portofolio."""
+    from fincept_terminal import fincept_analyze
+    spot, adj = _fusion_inputs()
+    a = fincept_analyze(adj, spot)
+    a["spot_price"] = spot
+    return a
+
+
+@mcp.tool()
+def get_gold_fincept_analytics_html() -> str:
+    """Analitik gaya FinceptTerminal dalam teks siap-kirim Telegram."""
+    a = get_gold_fincept_analytics()
+    sv, dcf, opt = a["sharpe_var"], a["dcf"], a["option_call_ATM_30d"]
+    rk = "\n".join(f"• {r}" for r in a["risks"])
+    return (
+        f"🏦 *FINCEPT ANALYTICS XAUUSD*\n"
+        f"💵 Spot: ${a['spot_price']:,.2f}\n"
+        f"📊 Sharpe (ann.): {sv['sharpe_daily']}  |  Vol {sv['vol_daily_pct']}%  |  VaR95 {sv['var95_daily_pct']}%\n"
+        f"💎 DCF fair ${dcf['fair_value']:,.2f} ({dcf['verdict']}, gap {dcf['gap_pct']}%)\n"
+        f"🧮 Call ATM 30d ≈ ${opt['call']:,.2f} (delta {opt['delta']})\n"
+        f"🏛️ Yield proxy ≈ {a['bond_proxy']['yield_approx_pct']}%\n"
+        f"💼 Min-var: emas {a['portfolio']['w_gold']} vs proxy {a['portfolio']['w_proxy']}\n"
+        f"{rk}\n\n⚠️ {DISCLAIMER}"
+    )
+
+
+@mcp.tool()
+def get_gold_autohedge_plan() -> dict[str, Any]:
+    """Rencana gaya AutoHedge: Director-Quant-Risk-Execution (dict)."""
+    from autohedge import autohedge_pipeline
+    from vibe_trading import vibe_analyze
+    from fincept_terminal import fincept_analyze
+    spot, adj = _fusion_inputs()
+    vibe = vibe_analyze(adj, spot)
+    fin = fincept_analyze(adj, spot)
+    pip = PIP_VALUE if PIP_VALUE > 0 else 1.0
+    plan = autohedge_pipeline(spot, adj, vibe, fin,
+                              sl_pts=SCALP_SL_PIPS * pip,
+                              tp1_pts=SCALP_TP1_PIPS * pip,
+                              tp2_pts=SCALP_TP2_PIPS * pip)
+    plan["spot_price"] = spot
+    plan["vibe"] = {"bias": vibe["bias"], "score_0_100": vibe["score_0_100"]}
+    plan["fincept"] = {"verdict": fin["dcf"]["verdict"], "sharpe": fin["sharpe_var"]["sharpe_daily"]}
+    return plan
+
+
+@mcp.tool()
+def get_gold_autohedge_plan_html() -> str:
+    """Rencana gaya AutoHedge dalam teks siap-kirim Telegram."""
+    p = get_gold_autohedge_plan()
+    d, q, r, e = p["director"], p["quant"], p["risk"], p["execution"]
+    order = e.get("order", e.get("reason", "—"))
+    return (
+        f"🐝 *AUTO-HEDGE PLAN XAUUSD*\n"
+        f"💵 Spot: ${p['spot_price']:,.2f}\n"
+        f"🎬 Director: {d['thesis']} → *{d['strategy']}* ({d['conviction']}%)\n"
+        f"📊 Quant: tren {q['trend']}, vol {q['vol_daily']}%, range14 {q['range14']}\n"
+        f"🛡️ Risk: {r['note']}\n"
+        f"⚙️ Execution: {order}\n"
+        f"🔗 Vibe {p['vibe']['bias']} ({p['vibe']['score_0_100']}) | Fincept {p['fincept']['verdict']}\n\n⚠️ {DISCLAIMER}"
+    )
+
+
+@mcp.tool()
+def get_gold_fusion_signal() -> dict[str, Any]:
+    """Sinyal FUSION: vote 4 engine + SATU zona entry konfluensi (dict).
+
+    Vote: SMC-POI + Vibe + Fincept-DCF + AutoHedge-Director -> arah final.
+    Zona: overlap 5 lapis (SMC-POI, EMA21-M15, Bollinger, DCF-value,
+    Risk-band) -> skor 0-10 + grade A+/A/B/C (lihat fusion_entry.py).
+    """
+    from fusion_entry import collect_layers, find_best_zone, plan_entry
+    smc = get_gold_scalping_signal()
+    vibe = get_gold_vibe_analysis()
+    fin = get_gold_fincept_analytics()
+    hedge = get_gold_autohedge_plan()
+    votes = [smc.get("bias", "TUNGGU"), vibe.get("bias", "NETRAL")]
+    gv = fin.get("dcf", {}).get("verdict", "FAIR")
+    votes.append("BUY" if gv == "UNDERVALUED" else ("SELL" if gv == "OVERVALUED" else "NETRAL"))
+    votes.append(hedge.get("director", {}).get("vibe_bias", "NETRAL"))
+    norm = {"BUY": 1, "SELL": -1}
+    total = sum(norm.get(v, 0) for v in votes)
+    arah = "BUY" if total >= 2 else ("SELL" if total <= -2 else "TUNGGU")
+    spot = float(smc.get("spot_price"))
+    atr = float(smc.get("atr15") or vibe.get("atr14") or 5.0)
+    layers = collect_layers(smc, vibe, fin, hedge, spot)
+    zone = find_best_zone(layers, votes, spot, atr)
+    pip = PIP_VALUE if PIP_VALUE > 0 else 1.0
+    lvl = plan_entry(arah, zone, spot, atr, SCALP_SL_PIPS * pip,
+                     SCALP_TP1_PIPS * pip, SCALP_TP2_PIPS * pip)
+    def _pscore(src: dict) -> float:
+        """Ambil skor numerik dari probability_score ('4/6' -> 4.0)."""
+        v = src.get("probability_score", 0)
+        try:
+            return float(str(v).split("/")[0])
+        except (ValueError, AttributeError):
+            return 0.0
+
+    skor = round(min(6, abs(total) + _pscore(smc) / 3), 1)
+    return {"mode": "fusion-3repo-zona", "direction": arah, "votes": votes,
+            "vote_sum": total, "probability_score": skor,
+            "spot_price": spot, "zona_entry": zone, "lapisan_zona": layers,
+            "entry_limit": lvl["entry_limit"], "stop_loss": lvl["stop_loss"],
+            "take_profit_1": lvl["take_profit_1"],
+            "take_profit_2": lvl["take_profit_2"],
+            "jarak_entry_pts": lvl["jarak_entry_pts"],
+            "vibe_bias": vibe.get("bias"), "vibe_score": vibe.get("score_0_100"),
+            "fincept_verdict": gv, "hedge_order": hedge.get("execution", {}),
+            "reason": (f"Vote {votes} (sum {total:+}) -> {arah}. "
+                       f"Zona {zone['bawah']:,.2f}-{zone['atas']:,.2f} "
+                       f"(grade {zone['grade']}, skor {zone['skor_0_10']}/10, "
+                       f"{'+'.join(zone['lapis']) or 'tanpa lapis'}). "
+                       f"Vibe {vibe.get('bias')} {vibe.get('score_0_100')}, Fincept {gv}."),
+            "disclaimer": DISCLAIMER}
+
+
+@mcp.tool()
+def get_gold_fusion_signal_html() -> str:
+    """Sinyal FUSION: vote + zona entry konfluensi, teks siap-kirim Telegram."""
+    a = get_gold_fusion_signal()
+    z = a["zona_entry"]
+    tunggu = a["direction"] == "TUNGGU"
+    header = "🧬 *FUSION ZONA — TUNGGU*\n" if tunggu else f"🧬 *FUSION ZONA {a['direction']} (grade {z['grade']})*\n"
+    return (
+        f"{header}"
+        f"💵 Spot: ${a['spot_price']:,.2f}\n"
+        f"🗳️ Vote: {' | '.join(a['votes'])} (sum {a['vote_sum']:+})  |  Skor {a['probability_score']}/6\n"
+        f"📦 Zona entry: *{z['bawah']:,.2f}-{z['atas']:,.2f}* "
+        f"(skor {z['skor_0_10']}/10, lebar {z['lebar_atr']}x ATR)\n"
+        f"🧱 Lapis: {'+'.join(z['lapis']) or '—'}\n"
+        f"📍 {z['status']}\n"
+        f"🎯 Entry limit: {a['entry_limit']:,.2f} ({a['jarak_entry_pts']:.2f} pts dari spot)\n"
+        f"🛑 SL: {a['stop_loss']:,.2f}  |  🥇 TP1: {a['take_profit_1']:,.2f}  |  🥈 TP2: {a['take_profit_2']:,.2f}\n"
+        f"🧠 {a['reason']}\n\n⚠️ {a['disclaimer']}"
+    )
+
+
+# ============================================ all-in-one (gabungan per mode)
+# /m5      -> fusion zona + scalp M5 + scalp M15 + vibe + fincept + hedge
+# /intraday-> fusion zona + intraday HTF->LTF + SMC + vibe + fincept + hedge
+# /swing   -> fusion zona + swing HTF->LTF + SMC + vibe + fincept + hedge
+# Semua engine 3 repo (Vibe-Trading/Fincept/AutoHedge + SMC) jadi 1 balasan.
+
+_ALL_IN_ONE_MODES = {"m5", "intraday", "swing"}
+
+
+def _normalize_all_in_one_mode(mode: str) -> str:
+    m = (mode or "").strip().lower()
+    if m in ("m5", "scalp", "scalping", "scalp5", "scalping5", "signal", "analisa", "vibe"):
+        return "m5"
+    if m in ("intraday", "intra", "daytrade", "smc", "smct", "fincept"):
+        return "intraday"
+    if m in ("swing", "hedge", "autohedge", "fusion", "fusi"):
+        return "swing"
+    return "m5" if m in _ALL_IN_ONE_MODES or not m else m
+
+
+@mcp.tool()
+def get_gold_all_in_one(mode: str = "m5") -> dict[str, Any]:
+    """Analisa lengkap satu mode: core sinyal + SMC + Vibe + Fincept + AutoHedge + zona FUSION.
+
+    mode: "m5" (scalping M5/M15), "intraday" (H1->M15), "swing" (D1->H1).
+    """
+    m = _normalize_all_in_one_mode(mode)
+    if m == "m5":
+        core = get_gold_scalping_m5_signal()
+        scalp_m15 = get_gold_scalping_signal()
+    elif m == "intraday":
+        core = get_gold_intraday_signal()
+        scalp_m15 = None
+    else:
+        core = get_gold_swing_signal()
+        scalp_m15 = None
+    smc = get_gold_smc_analysis()
+    vibe = get_gold_vibe_analysis()
+    fin = get_gold_fincept_analytics()
+    hedge = get_gold_autohedge_plan()
+    fusion = get_gold_fusion_signal()
+    return {"mode": m, "core": core, "scalp_m15": scalp_m15, "smc": smc,
+            "vibe": vibe, "fincept": fin, "hedge": hedge, "fusion": fusion,
+            "spot_price": fusion.get("spot_price")}
+
+
+@mcp.tool()
+def get_gold_all_in_one_html(mode: str = "m5") -> str:
+    """Versi teks all-in-one siap-kirim Telegram (seksi dipisah baris kosong)."""
+    a = get_gold_all_in_one(mode)
+    m = a["mode"]
+    judul = {"m5": "SCALPING M5", "intraday": "INTRADAY", "swing": "SWING"}[m]
+    spot = a.get("spot_price")
+    header = f"🧭 *ALL-IN-ONE {judul} XAUUSD*\n💵 Spot: ${spot:,.2f}\n"
+    sections: list[str] = [header, "🧬 *ZONA KONFLUENSI (3 repo)*", get_gold_fusion_signal_html()]
+    if m == "m5":
+        sections.append("⚡ *TRIGGER M5 + ZONA M15*")
+        sections.append(get_gold_scalping_m5_signal_html())
+        sections.append("📈 *MOMENTUM M15*")
+        sections.append(get_gold_scalping_signal_html())
+    else:
+        sections.append("📐 *HTF → LTF (OB/FVG/sweep)*")
+        sections.append(
+            get_gold_intraday_signal_html() if m == "intraday" else get_gold_swing_signal_html())
+        sections.append("🧱 *SMC/ICT*")
+        sections.append(get_gold_smc_analysis_html())
+    v = a["vibe"]
+    sections.append(
+        f"🤖 *VIBE-TRADING*: {v['bias']} skor {v['score_0_100']}/100 | "
+        f"EMA {v['ema9']}/{v['ema21']} | RSI {v['rsi14']} | "
+        f"MACD {v['macd']['hist']:+} | backtest {v['backtest']['trades']} trade WR "
+        f"{v['backtest']['winrate_pct']}%")
+    f_ = a["fincept"]
+    sv = f_["sharpe_var"]
+    sections.append(
+        f"🏦 *FINCEPT*: {f_['dcf']['verdict']} (gap {f_['dcf']['gap_pct']}%) | "
+        f"Sharpe {sv['sharpe_daily']} | VaR95 {sv['var95_daily_pct']}% | "
+        f"portofolio emas {f_['portfolio']['w_gold']}")
+    h = a["hedge"]
+    order = h["execution"].get("order", h["execution"].get("reason", "—"))
+    sections.append(f"🐝 *AUTOHEDGE*: {h['director']['strategy']} ({h['director']['conviction']}%) | {order}")
+    sections.append(f"⚠️ {DISCLAIMER}")
+    return "\n\n".join(sections)
 
 
 if __name__ == "__main__":

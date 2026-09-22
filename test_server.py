@@ -61,6 +61,22 @@ async def main() -> None:
             print("\n--- get_gold_smc_analysis_html ---")
             print(res.content[0].text)
 
+            res = await session.call_tool("get_gold_intraday_signal", {})
+            print("\n--- get_gold_intraday_signal (bias H1 -> zona POI M15) ---")
+            print(res.content[0].text)
+
+            res = await session.call_tool("get_gold_intraday_signal_html", {})
+            print("\n--- get_gold_intraday_signal_html ---")
+            print(res.content[0].text)
+
+            res = await session.call_tool("get_gold_swing_signal", {})
+            print("\n--- get_gold_swing_signal (bias D1 -> zona POI H1) ---")
+            print(res.content[0].text)
+
+            res = await session.call_tool("get_gold_swing_signal_html", {})
+            print("\n--- get_gold_swing_signal_html ---")
+            print(res.content[0].text)
+
             # Cek cache intraday: dua panggilan scalp beruntun harus identik.
             s1 = json.loads(
                 (await session.call_tool("get_gold_scalping_signal", {})).content[0].text

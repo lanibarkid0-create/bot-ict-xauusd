@@ -118,6 +118,53 @@ async def main() -> None:
     )
     check("reply_smc kirim teks SMC + skenario + Markdown", smc_ok)
 
+    # 5b) Alur normal: intraday (bias H1 -> zona POI M15).
+    u = FakeUpdate()
+    await bot_telegram.reply_intraday(u, None)
+    print("\n--- reply_intraday (via get_gold_intraday_signal_html) ---")
+    print(u.message.sent[-1])
+    intra_ok = (
+        bool(u.message.sent)
+        and u.message.parse_modes[-1] == "Markdown"
+        and "INTRADAY XAUUSD" in u.message.sent[-1]
+        and "Zona POI" in u.message.sent[-1]
+    )
+    check("reply_intraday kirim teks INTRADAY + zona POI + Markdown", intra_ok)
+
+    # 5c) Alur normal: swing (bias D1 -> zona POI H1).
+    u = FakeUpdate()
+    await bot_telegram.reply_swing(u, None)
+    print("\n--- reply_swing (via get_gold_swing_signal_html) ---")
+    print(u.message.sent[-1])
+    swing_ok = (
+        bool(u.message.sent)
+        and u.message.parse_modes[-1] == "Markdown"
+        and "SWING XAUUSD" in u.message.sent[-1]
+        and "Zona POI" in u.message.sent[-1]
+    )
+    check("reply_swing kirim teks SWING + zona POI + Markdown", swing_ok)
+
+    # 5d) Engine baru 3-repo: vibe / fincept / hedge / fusion (mock _call_mcp).
+    _orig_call = bot_telegram._call_mcp
+
+    async def _fake_call(tool: str, _args: dict | None = None) -> str:
+        return f"<{tool} OK>"
+
+    bot_telegram._call_mcp = _fake_call
+    try:
+        for fn_name, tool, key in [
+            ("reply_vibe", "get_gold_vibe_analysis_html", "VIBE"),
+            ("reply_fincept", "get_gold_fincept_analytics_html", "FINCEPT"),
+            ("reply_hedge", "get_gold_autohedge_plan_html", "HEDGE"),
+            ("reply_fusion", "get_gold_fusion_signal_html", "FUSION"),
+        ]:
+            u = FakeUpdate()
+            await getattr(bot_telegram, fn_name)(u, None)
+            ok = bool(u.message.sent) and tool in u.message.sent[-1]
+            check(f"{fn_name} panggil {tool} + Markdown", ok)
+    finally:
+        bot_telegram._call_mcp = _orig_call
+
     # 6) Jalur error: pesan error berisi '[Errno ...]' harus dikirim POLOS.
     original = bot_telegram._call_mcp
 

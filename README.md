@@ -15,8 +15,11 @@ Bot Telegram yang mengambil **harga emas XAUUSD secara real-time** melalui
 ## Struktur
 | File | Peran |
 |------|-------|
-| `gold_mcp_server.py` | MCP server, mengekspos tool `get_gold_price`, `get_gold_price_html`, `get_gold_analysis`, `get_gold_analysis_html`, `get_gold_scalping_signal`, `get_gold_scalping_signal_html`, `get_gold_scalping_m5_signal`, `get_gold_scalping_m5_signal_html` |
-| `bot_telegram.py` | Bridge: bot Telegram → MCP client → MCP server → reply harga/signal/scalp |
+| `gold_mcp_server.py` | MCP server, mengekspos tool `get_gold_price`, `get_gold_price_html`, `get_gold_analysis`, `get_gold_analysis_html`, `get_gold_scalping_signal`, `get_gold_scalping_signal_html`, `get_gold_scalping_m5_signal`, `get_gold_scalping_m5_signal_html`, `get_gold_smc_analysis`, `get_gold_smc_analysis_html`, `get_gold_intraday_signal`, `get_gold_intraday_signal_html`, `get_gold_swing_signal`, `get_gold_swing_signal_html` |
+| `bot_telegram.py` | Bridge: bot Telegram → MCP client → MCP server → reply harga/signal/scalp/smc/intraday/swing/vibe/fincept/hedge/fusion |
+| `vibe_trading.py` | 🤖 Adapter Vibe-Trading (HKUDS): EMA/RSI/MACD/BB + backtest EMA-cross (pure python) |
+| `fincept_terminal.py` | 🏦 Adapter FinceptTerminal: Sharpe/VaR/DCF/opsi Black-Scholes/yield/portofolio min-variance |
+| `autohedge.py` | 🐝 Adapter AutoHedge (Swarm): pipeline Director→Quant→Risk→Execution + position sizing |
 | `test_server.py` | Test end-to-end memanggil seluruh tool MCP (tanpa Telegram) |
 | `test_bridge.py` | Test jalur bridge bot_telegram → MCP (tanpa Telegram, pakai token dummy): teks harga kembali, sesi MCP dipakai ulang, error tool → exception |
 | `test_handlers.py` | Test handler bot (`reply_price`/`reply_signal`/`reply_scalp`/`reply_scalp_m5`/`reply_smc`) via Update palsu (tanpa token) |
@@ -35,6 +38,21 @@ Bot Telegram yang mengambil **harga emas XAUUSD secara real-time** melalui
 | `get_gold_scalping_signal_html` | Versi teks siap-kirim Telegram dari sinyal scalping di atas |
 | `get_gold_scalping_m5_signal` | **Scalping M5 + zona M15**: trigger dari M5, entry LIMIT di batas zona M15, SL 5 pip / TP 10 pip (R:R 1:2) / TP 15 pip (R:R 1:3), skor confluence 0–6, gate volatilitas ATR5 (dict) |
 | `get_gold_scalping_m5_signal_html` | Versi teks siap-kirim Telegram dari sinyal scalping M5 di atas |
+| `get_gold_intraday_signal` | **Intraday HTF→LTF**: bias H1 (+tren D1) → entry LIMIT di zona POI M15 (OB/FVG/EQL), SL 80 pip / TP1 160 / TP2 240 (R:R 1:2/1:3), skor confluence 0–6 (dict) |
+| `get_gold_intraday_signal_html` | Versi teks siap-kirim Telegram dari sinyal intraday di atas |
+| `get_gold_swing_signal` | **Swing HTF→LTF**: bias D1 → entry LIMIT di zona POI H1 (OB/FVG/EQH), SL 200 pip / TP1 400 / TP2 600 (R:R 1:2/1:3), tahan 2–5 hari (dict) |
+| `get_gold_swing_signal_html` | Versi teks siap-kirim Telegram dari sinyal swing di atas |
+| `get_gold_vibe_analysis` | 🤖 **Vibe-Trading**: EMA9/21, RSI14, MACD, Bollinger + backtest EMA-cross + skor 0–100 (dict) |
+| `get_gold_vibe_analysis_html` | Versi teks siap-kirim Telegram dari analisa Vibe di atas |
+| `get_gold_fincept_analytics` | 🏦 **FinceptTerminal**: Sharpe/VaR, DCF value-gap, opsi call Black-Scholes, yield obligasi, portofolio min-variance (dict) |
+| `get_gold_fincept_analytics_html` | Versi teks siap-kirim Telegram dari analitik Fincept di atas |
+| `get_gold_autohedge_plan` | 🐝 **AutoHedge**: pipeline Director→Quant→Risk→Execution + position sizing lot (dict) |
+| `get_gold_autohedge_plan_html` | Versi teks siap-kirim Telegram dari rencana AutoHedge di atas |
+| `get_gold_fusion_signal` | 🧬 **FUSION 3-repo**: vote SMC+Vibe+Fincept+AutoHedge → arah final + level scalping M15 (dict) |
+| `get_gold_fusion_signal_html` | Versi teks siap-kirim Telegram dari sinyal fusion di atas |
+
+**Command Telegram baru:** `/vibe` (Vibe-Trading), `/fincept` (Fincept), `/hedge` atau `/autohedge` (AutoHedge),
+`/fusion` atau `/fusi` (gabungan ketiganya).
 
 **Metode analisa:** tren dari **SMA5 vs SMA20** + posisi harga, level dari
 **swing high/low 3 hari**, jarak SL memakai **ATR-14**. Histori harian diambil
@@ -159,6 +177,46 @@ Contoh output (ringkas):
 📖 Skenario: likuiditas → imbalance
 ```
 
+## Mode INTRADAY HTF→LTF (`/intraday`, `/intra`, `/daytrade`)
+Prinsip **HTF bias, LTF area**: timeframe tinggi (H1, dengan filter tren D1)
+menentukan **arah** — jangan melawan — lalu timeframe rendah (M15) dipindai
+mencari **area entry (POI) terbaik** tempat harga kemungkinan besar memantul:
+order block (OB), fair value gap (FVG/imbalance), atau equal lows/highs
+(zona likuiditas). Entry = **LIMIT di zona POI**, bukan entry pasar.
+
+* **Bias HTF:** skor berbobot dari EMA9/EMA21, RSI, momentum 3-bar, struktur
+  BOS/CHOCH H1, displacement H1, plus tren harian (SMA5 vs SMA20).
+  Bias `NETRAL` → **TUNGGU** (jangan entry).
+* **POI LTF (M15):** dipilih otomatis — prioritas **OB fresh (3) > FVG (2) >
+  zona likuiditas EQ (1)**; skor sama → zona terdekat dari spot.
+  BUY dicari di bawah harga (discount), SELL di atas (premium).
+* **SL/TP:** SL **80 pip**, TP1 **160 pip** (R:R 1:2), TP2 **240 pip** (R:R 1:3);
+  berlaku **12 jam** (tahan satu sesi London/New York).
+* **Filter:** skor confluence LTF 0–6 (OB fresh, FVG, EMA, RSI, momentum,
+  displacement) + gate volatilitas ATR M15. Skor < `GOLD_INTRA_MIN_SCORE`
+  (default 4) atau tidak ada POI valid → **TUNGGU** + alasan jelas.
+  Bot tidak pernah mengklaim zona "pasti" didatangi — zona hanya probabilistik.
+
+Contoh output (ringkas):
+```
+📈 INTRADAY XAUUSD (H1 bias → M15 zona)
+💵 Spot: $4,311.40 | Bias H1: BUY (7 vs 2)
+➡️ Arah: BUY | Order: LIMIT
+🎯 Entry limit: 4,292.30 (19.10 poin dari spot)
+📦 Zona POI: Order Block bullish 4,289.40–4,292.30 (fresh, 3.20x ATR)
+🛑 SL: 4,232.30 (80 pip) | 🥇 TP1: 4,372.30 (160 pip, R:R 1:2.00)
+```
+
+## Mode SWING HTF→LTF (`/swing`)
+Versi lambat dari intraday: **bias dari D1**, zona POI dipindai di **H1** —
+cocok untuk posisi yang tahan **2–5 hari**.
+
+* **Bias HTF:** analisa harian penuh (EMA/RSI/momentum/struktur/displacement D1).
+* **POI LTF (H1):** pilihan zona sama (OB fresh > FVG > EQH/EQH likuiditas).
+* **SL/TP:** SL **200 pip**, TP1 **400 pip** (R:R 1:2), TP2 **600 pip** (R:R 1:3);
+  order berlaku **72 jam** (`GOLD_SWING_VALID_HOURS`).
+* Filter & aturan TUNGGU identik dengan mode intraday.
+
 ## Setup
 1. **Pasang dependensi**
    ```bash
@@ -201,7 +259,29 @@ Perintah di Telegram:
 | `/signal` atau `/analisa` | Analisa price action + signal trading |
 | `/scalp` atau `/scalping` | Scalping momentum M15: SL 50 pip, TP 100 pip, entry LIMIT + skor high-probability |
 | `/m5`, `/scalp5`, atau `/scalping5` | Scalping momentum M5 (trigger lebih cepat) dengan zona limit dari M15 |
+| `/smc` atau `/smct` | SMC/ICT: bias → skenario imbalan↔likuiditas → order block M5 |
+| `/intraday`, `/intra`, atau `/daytrade` | Intraday: bias H1 → entry LIMIT di zona POI M15 (OB/FVG/EQL), SL 80 pip, tahan 1 sesi |
+| `/swing` | Swing: bias D1 → entry LIMIT di zona POI H1 (OB/FVG/EQH), SL 200 pip, tahan 2–5 hari |
 | teks apa pun | Dibalas harga XAUUSD |
+
+## Deployment Railway
+
+Konfigurasi deployment tersedia di folder `xauusd-bot/` (bot emas, bukan echo bot).
+Jika memakai repository ini, set **Root Directory** layanan ke `/xauusd-bot`.
+Konfigurasi saat ini memakai `Dockerfile` dan `railway.json`; perintah startup
+adalah `python -u bot_telegram.py`.
+
+- Set `BOT_TOKEN` melalui **Variables** Railway, bukan di Git atau chat.
+- Set `BOT_MODE=polling` dan gunakan **satu replika**.
+- Bot polling tidak membutuhkan domain publik atau HTTP health-check path.
+- Hentikan instance lokal atau deployment lama dengan token yang sama sebelum
+  mengaktifkan layanan untuk menghindari konflik `getUpdates`.
+- Periksa log deployment, lalu uji `/start` dan `/harga` di Telegram.
+- PC boleh dimatikan setelah bot berjalan di Railway. Ketersediaan tetap bergantung
+  pada layanan, kuota, dan saldo akun; hosting gratis tanpa batas tidak dijamin.
+
+Dokumentasi ini bukan konfirmasi bahwa deployment sudah berhasil.
+
 
 ## Mode deploy (webhook)
 Selain long-polling, bot bisa jalan sebagai **webhook** (cocok untuk VPS/server):
@@ -246,6 +326,21 @@ mendengarkan di `https://domain-anda.com/telegram`.
 | `GOLD_SCALP_M5_TP2_PIPS` | ❌ | `15` (TP2 mode M5, pip → R:R 1:3) |
 | `GOLD_SCALP_M5_MIN_SCORE` | ❌ | `4` (ambang skor confluence 0–6 mode M5) |
 | `GOLD_SCALP_M5_VALID_HOURS` | ❌ | `1.5` (masa berlaku order limit M5, jam — scalping cepat) |
+| `GOLD_INTRA_SL_PIPS` | ❌ | `80` (SL mode intraday, pip) |
+| `GOLD_INTRA_TP1_PIPS` | ❌ | `160` (TP1 intraday, pip → R:R 1:2) |
+| `GOLD_INTRA_TP2_PIPS` | ❌ | `240` (TP2 intraday, pip → R:R 1:3) |
+| `GOLD_INTRA_MIN_SCORE` | ❌ | `4` (ambang skor confluence 0–6 intraday) |
+| `GOLD_INTRA_VALID_HOURS` | ❌ | `12` (masa berlaku order intraday, jam — 1 sesi) |
+| `GOLD_H1_CACHE_TTL` | ❌ | `300` (cache histori H1 untuk bias intraday, detik) |
+| `GOLD_SWING_SL_PIPS` | ❌ | `200` (SL mode swing, pip) |
+| `GOLD_SWING_TP1_PIPS` | ❌ | `400` (TP1 swing, pip → R:R 1:2) |
+| `GOLD_SWING_TP2_PIPS` | ❌ | `600` (TP2 swing, pip → R:R 1:3) |
+| `GOLD_SWING_MIN_SCORE` | ❌ | `4` (ambang skor confluence 0–6 swing) |
+| `GOLD_SWING_VALID_HOURS` | ❌ | `72` (masa berlaku order swing, jam — 2–5 hari) |
+| `GOLD_SMC_BIAS_W_HTF` | ❌ | `2` (bobot tren harian pada skor bias SMC) |
+| `GOLD_SMC_BIAS_W_MOM` | ❌ | `2` (bobot momentum M15/M5) |
+| `GOLD_SMC_BIAS_W_STRUCT` | ❌ | `3` (bobot struktur break-of-structure) |
+| `GOLD_SMC_BIAS_W_DISP` | ❌ | `1` (bobot displacement) |
 
 ## Troubleshooting
 | Gejala | Penyebab & solusi |

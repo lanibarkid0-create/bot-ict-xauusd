@@ -85,6 +85,54 @@ _BASE_DIR = Path(__file__).resolve().parent
 _LOCK_PATH = _BASE_DIR / "bot.lock"
 _PID_PATH = _BASE_DIR / "bot.pid"
 
+# Lock mekanisme cross-platform:
+#   Windows -> msvcrt.locking (1 byte offset 0)
+#   Linux/Mac -> fcntl.flock (exclusive, non-blocking)
+# Jika platform tidak mendukung locking (jarang), lewati saja — tidak fatal.
+if sys.platform == "win32":
+    import msvcrt  # type: ignore[import-not-found]  # noqa: UP031
+    _HAS_FCNTL = False
+    _LOCK_EX = msvcrt.LK_NBLCK
+    _LOCK_UN = msvcrt.LK_UNLCK
+else:
+    try:
+        import fcntl  # type: ignore[import-not-found]  # noqa: UP031
+        _HAS_FCNTL = True
+        _LOCK_EX = fcntl.LOCK_EX | fcntl.LOCK_NB
+        _LOCK_UN = fcntl.LOCK_UN
+    except ImportError:  # platform tanpa fcntl (mis. beberapa embedded)
+        fcntl = None  # type: ignore[assignment]
+        _HAS_FCNTL = False
+        _LOCK_EX = None
+        _LOCK_UN = None
+
+
+def _lock_acquire(fh) -> bool:
+    """Coba lock eksklusif 1-byte di offset 0. True bila berhasil."""
+    try:
+        if sys.platform == "win32":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), _LOCK_EX, 1)
+            return True
+        if _HAS_FCNTL and fcntl is not None:
+            fcntl.flock(fh.fileno(), _LOCK_EX)
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _lock_release(fh) -> None:
+    """Lepas lock (harmless bila tidak ter-lock)."""
+    try:
+        if sys.platform == "win32":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), _LOCK_UN, 1)
+        elif _HAS_FCNTL and fcntl is not None:
+            fcntl.flock(fh.fileno(), _LOCK_UN)
+    except OSError:
+        pass
+
 
 def _cleanup_lock() -> None:
     """Hapus PID milik sendiri sebelum melepas lock; sentinel tetap ada."""
@@ -98,8 +146,7 @@ def _cleanup_lock() -> None:
         pass
     # Jangan unlink bot.lock: proses baru mungkin sudah membuka inode/file ini.
     try:
-        _lock_fh.seek(0)
-        msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+        _lock_release(_lock_fh)
     finally:
         _lock_fh.close()
         _lock_fh = None
@@ -315,14 +362,101 @@ async def reply_smc(update: Update, _ctx) -> None:
     await _safe_reply(update.message, text)
 
 
+async def reply_intraday(update: Update, _ctx) -> None:
+    """Balas sinyal INTRADAY (H1 bias -> zona M15)."""
+    await update.message.chat.send_action("typing")
+    try:
+        text = await _call_mcp("get_gold_intraday_signal_html")
+    except Exception as exc:  # noqa: BLE001 - kirim error ke user
+        await _safe_reply(update.message, f"⚠️ Gagal menganalisa intraday: {exc}", parse_mode=None)
+        return
+    await _safe_reply(update.message, text)
+
+
+async def reply_swing(update: Update, _ctx) -> None:
+    """Balas sinyal SWING (D1 bias -> zona H1)."""
+    await update.message.chat.send_action("typing")
+    try:
+        text = await _call_mcp("get_gold_swing_signal_html")
+    except Exception as exc:  # noqa: BLE001 - kirim error ke user
+        await _safe_reply(update.message, f"⚠️ Gagal menganalisa swing: {exc}", parse_mode=None)
+        return
+    await _safe_reply(update.message, text)
+
+
+async def _reply_tool(update: Update, tool: str, err_label: str) -> None:
+    """Helper generik: panggil tool HTML -> balas (dipakai 3 engine + fusion)."""
+    await update.message.chat.send_action("typing")
+    try:
+        text = await _call_mcp(tool)
+    except Exception as exc:  # noqa: BLE001
+        await _safe_reply(update.message, f"⚠️ Gagal {err_label}: {exc}", parse_mode=None)
+        return
+    await _safe_reply(update.message, text)
+
+
+async def reply_all(update: Update, mode: str) -> None:
+    """ALL-IN-ONE: 1 command -> semua engine (zona FUSION + core + SMC + 3 repo).
+
+    Hasil panjang dikirim per-seksi (chunk <=3800 char) agar tidak kena limit
+    pesan Telegram 4096 char.
+    """
+    await update.message.chat.send_action("typing")
+    try:
+        text = await _call_mcp("get_gold_all_in_one_html", {"mode": mode})
+    except Exception as exc:  # noqa: BLE001
+        await _safe_reply(update.message, f"⚠️ Gagal analisa all-in-one: {exc}", parse_mode=None)
+        return
+    for chunk in _split_chunks(text):
+        await _safe_reply(update.message, chunk)
+
+
+def _split_chunks(text: str, limit: int = 3800) -> list[str]:
+    """Pecah teks jadi beberapa pesan di batas seksi (baris kosong)."""
+    parts: list[str] = []
+    cur = ""
+    for block in text.split("\n\n"):
+        if len(cur) + len(block) + 2 <= limit:
+            cur = f"{cur}\n\n{block}" if cur else block
+            continue
+        if cur:
+            parts.append(cur)
+            cur = ""
+        while len(block) > limit:
+            parts.append(block[:limit])
+            block = block[limit:]
+        cur = block
+    if cur:
+        parts.append(cur)
+    return parts or [""]
+
+
+async def reply_m5(update: Update, _ctx) -> None:
+    """/m5 (dan /signal, /scalp, /vibe, dst): paket scalping lengkap."""
+    await reply_all(update, "m5")
+
+
+async def reply_intraday_all(update: Update, _ctx) -> None:
+    """/intraday (dan /smc, /fincept, dst): paket intraday lengkap."""
+    await reply_all(update, "intraday")
+
+
+async def reply_swing_all(update: Update, _ctx) -> None:
+    """/swing (dan /hedge, /fusion, dst): paket swing lengkap."""
+    await reply_all(update, "swing")
+
+
 async def cmd_start(update: Update, _ctx) -> None:
     await update.message.reply_text(
-        "🤖 Halo!\n"
-        "• /harga — harga XAUUSD saat ini\n"
-        "• /signal — analisa price action + signal trading (BUY/SELL, entry, SL, TP)\n"
-        "• /scalp — scalping momentum M15: SL 50 pip, TP 100 pip, entry LIMIT + skor high-probability\n"
-        "• /m5 — scalping momentum M5 (trigger lebih cepat) dengan zona M15\n"
-        "• /smc — SMC/ICT: bias → skenario imbalan↔likuiditas → order block M5\n"
+        "🤖 Halo! Analisa XAUUSD gabungan 3 engine (Vibe-Trading, Fincept, AutoHedge + SMC).\n\n"
+        "⚡ /m5 — SCALPING lengkap: zona konfluensi 3 repo + trigger M5 + momentum M15\n"
+        " + vibe/fincept/hedge (gabungan /signal, /scalp, /vibe)\n\n"
+        "📈 /intraday — INTRADAY lengkap: zona konfluensi + H1→M15 (OB/FVG/sweep) + SMC\n"
+        " + vibe/fincept/hedge (gabungan /smc)\n\n"
+        "🌊 /swing — SWING lengkap: zona konfluensi + D1→H1 + SMC + vibe/fincept/hedge\n\n"
+        "💵 /harga — harga XAUUSD saat ini\n\n"
+        "Alias lama masih jalan: /signal /analisa /scalp /scalping /scalp5 /smc /smct\n"
+        "/intra /daytrade /fincept /vibe /hedge /autohedge /fusion /fusi\n"
         "Atau cukup ketik 'harga emas'."
     )
 
@@ -331,20 +465,19 @@ async def cmd_price(update: Update, _ctx) -> None:
     await reply_price(update, _ctx)
 
 
-async def cmd_signal(update: Update, _ctx) -> None:
-    await reply_signal(update, _ctx)
+async def cmd_m5(update: Update, _ctx) -> None:
+    """/m5 dan aliasnya (signal/scalp/vibe/...) -> paket scalping lengkap."""
+    await reply_m5(update, _ctx)
 
 
-async def cmd_smc(update: Update, _ctx) -> None:
-    await reply_smc(update, _ctx)
+async def cmd_intraday(update: Update, _ctx) -> None:
+    """/intraday dan aliasnya (smc/fincept/...) -> paket intraday lengkap."""
+    await reply_intraday_all(update, _ctx)
 
 
-async def cmd_scalp(update: Update, _ctx) -> None:
-    await reply_scalp(update, _ctx)
-
-
-async def cmd_scalp_m5(update: Update, _ctx) -> None:
-    await reply_scalp_m5(update, _ctx)
+async def cmd_swing(update: Update, _ctx) -> None:
+    """/swing dan aliasnya (hedge/fusion/...) -> paket swing lengkap."""
+    await reply_swing_all(update, _ctx)
 
 
 async def on_error(_update, context) -> None:
@@ -404,17 +537,14 @@ def _ensure_single_instance() -> None:
     global _lock_fh
     if _lock_fh is not None:
         return
-    # Tanpa truncate dan selalu byte ke-0, tidak bergantung cwd/panjang PID.
+    # Buka a+b (bukan w) agar tidak truncate file yang sedang dikunci proses lain.
     fh = _LOCK_PATH.open("a+b")
-    try:
-        fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-    except OSError as exc:
+    if not _lock_acquire(fh):
         fh.close()
         raise SystemExit(
             f"Bot lain masih berjalan atau lock tidak tersedia: {_LOCK_PATH}. "
             "Jangan jalankan polling kedua; periksa proses pemilik terlebih dahulu."
-        ) from exc
+        )
     _lock_fh = fh
     try:
         _PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
@@ -447,15 +577,15 @@ def _build_app() -> "object":
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("harga", cmd_price))
     app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("signal", cmd_signal))
-    app.add_handler(CommandHandler("analisa", cmd_signal))
-    app.add_handler(CommandHandler("scalp", cmd_scalp))
-    app.add_handler(CommandHandler("scalping", cmd_scalp))
-    app.add_handler(CommandHandler("m5", cmd_scalp_m5))
-    app.add_handler(CommandHandler("scalp5", cmd_scalp_m5))
-    app.add_handler(CommandHandler("scalping5", cmd_scalp_m5))
-    app.add_handler(CommandHandler("smc", cmd_smc))
-    app.add_handler(CommandHandler("smct", cmd_smc))
+    # Paket lengkap: /m5 (scalping), /intraday, /swing — semua alias lama
+    # diarahkan ke paket yang sesuai, jadi cukup 3 pilihan utama.
+    for _alias in ("m5", "scalp5", "scalping5", "scalping", "scalp", "signal",
+                   "analisa", "vibe"):
+        app.add_handler(CommandHandler(_alias, cmd_m5))
+    for _alias in ("intraday", "intra", "daytrade", "smc", "smct", "fincept"):
+        app.add_handler(CommandHandler(_alias, cmd_intraday))
+    for _alias in ("swing", "hedge", "autohedge", "fusion", "fusi"):
+        app.add_handler(CommandHandler(_alias, cmd_swing))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_price))
     return app
 
