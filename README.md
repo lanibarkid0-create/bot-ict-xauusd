@@ -74,6 +74,29 @@ sesi dibangun ulang otomatis. Set `MCP_PERSISTENT_SESSION=0` untuk kembali ke
 mode spawn-subprocess-per-pesan. Error dari tool dikonversi menjadi exception
 sehingga pengguna menerima pesan `⚠️ Gagal ...` yang rapi, bukan teks mentah.
 
+## Alur interaktif `/start` (zona TF → gaya → sinyal MTF)
+Ketik `/start` lalu ikuti 3 langkah lewat tombol inline:
+
+1. **Pilih zona timeframe** — 9 tombol: `M1 M3 M5 M10 M15 M20 M30 H1 H4`,
+   label tombol menampilkan pembentuk biasnya (mis. `M1 ← M15`).
+2. **Pilih gaya** — ⚡ SCALPING (order 2 jam) · 📈 INTRADAY (12 jam) ·
+   🌊 SWING (3 hari), plus tombol ◀️ Ubah timeframe untuk ganti zona.
+3. **Terima sinyal** — laporan `get_gold_mtf_signal_html(zone_tf, style)`
+   keluar sesuai peta zona → bias (entry di zona pilihan, arah dari TF bias),
+   dengan tombol 🔁 Ulangi / ◀️ Ganti TF di bawah laporan.
+
+Peta zona → bias (sumber: `unified_analysis.ZONE_BIAS_BY_TF`, dibacakan lewat
+tool `get_gold_timeframes`):
+
+| Zona | M1  | M3  | M5  | M10 | M15 | M20 | M30 | H1  | H4  |
+|------|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| Bias | M15 | M30 | H1  | H1  | H4  | H4  | H4  | D1  | D1  |
+
+Menu tombol diambil dari server MCP (`get_gold_timeframes`) supaya selalu
+sinkron dengan logika analisa; bila MCP gagal, bot memakai peta cadangan
+statis yang sama (dicek `test_handlers.py`). Gaya ditentukan dari pilihan
+user — zona tetap dari TF yang ditekan, SL/TP & masa berlaku order dari gaya.
+
 ## Mode scalping momentum (`/scalp`)
 Dirancang untuk **scalping momentum dengan SL/TP tetap dan order limit** —
 bukan analisa harian `/signal`.

@@ -26,9 +26,16 @@ from mcp.server.mcpserver import MCPServer
 GOLD_API_URL = "https://api.gold-api.com/price/XAU"
 # Histori harian diambil dari Yahoo Finance (COMEX gold futures GC=F) sebagai
 # proxy struktur harga; nilainya diselaraskan ke harga spot via offset.
+# range=3mo dipakai agar bias D1 punya cukup bar (>=25) untuk dihitung 3 engine
+# (range=1mo hanya ~22 bar sehingga bias D1 jatuh ke timeframe lebih kecil).
 YAHOO_HISTORY_URLS = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1mo",
-    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1mo",
+    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=3mo",
+    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=3mo",
+)
+# Histori mingguan (bias H4 -> zona W1, saringan swing W1).
+YAHOO_WEEKLY_URLS = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1wk&range=2y",
+    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=1wk&range=2y",
 )
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 TIMEOUT_SECONDS = 12
@@ -44,10 +51,12 @@ HISTORY_CACHE_TTL = float(os.getenv("GOLD_HISTORY_CACHE_TTL", "600"))
 INTRADAY_CACHE_TTL = float(os.getenv("GOLD_INTRADAY_CACHE_TTL", "180"))
 M5_CACHE_TTL = float(os.getenv("GOLD_M5_CACHE_TTL", "120"))
 H1_CACHE_TTL = float(os.getenv("GOLD_H1_CACHE_TTL", "300"))
+# M1 (entry scalping) paling cepat berubah -> cache paling pendek.
+M1_CACHE_TTL = float(os.getenv("GOLD_M1_CACHE_TTL", "60"))
 
 # ------------------------------------------------- mode scalping momentum
 # Histori intraday dipakai untuk membaca momentum jangka pendek, per timeframe:
-# M15 sebagai zona/bias, M5 sebagai trigger entry.
+# M15 sebagai zona/bias, M5 sebagai trigger entry, M1 sebagai entry presisi.
 YAHOO_INTRADAY_URLS: dict[str, tuple[str, ...]] = {
     "15m": (
         "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=5d",
@@ -57,13 +66,59 @@ YAHOO_INTRADAY_URLS: dict[str, tuple[str, ...]] = {
         "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=5m&range=5d",
         "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=5m&range=5d",
     ),
+    "1m": (
+        "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=5d",
+        "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=5d",
+    ),
     "60m": (
         "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=60m&range=1mo",
         "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=60m&range=1mo",
     ),
+    "30m": (
+        "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=30m&range=1mo",
+        "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=30m&range=1mo",
+    ),
 }
-# TTL cache per timeframe (detik): M15 lebih lambat berubah, M5 lebih cepat.
-INTRADAY_CACHE_TTLS = {"15m": INTRADAY_CACHE_TTL, "5m": M5_CACHE_TTL, "60m": H1_CACHE_TTL}
+# TTL cache per timeframe (detik): M15 lebih lambat berubah, M1 paling cepat.
+INTRADAY_CACHE_TTLS = {
+    "15m": INTRADAY_CACHE_TTL,
+    "5m": M5_CACHE_TTL,
+    "1m": M1_CACHE_TTL,
+    "60m": H1_CACHE_TTL,
+    "30m": float(os.getenv("GOLD_M30_CACHE_TTL", "240")),
+}
+
+# ============================== katalog timeframe (matriks zona -> bias)
+# Yahoo hanya menyediakan 1m/2m/5m/15m/30m/60m/1d/1wk/1mo, sehingga M3, M10,
+# M20, dan H4 TIDAK bisa diminta langsung — dibentuk dengan MENGGABUNGKAN
+# (resample) bar basis: 3x M1 = M3, 2x M5 = M10, 4x M5 = M20, 4x H1 = H4.
+# Setiap timeframe punya cache sendiri supaya panggilan beruntun tetap cepat.
+TF_SPECS: dict[str, dict[str, Any]] = {
+    "M1":  {"basis": "1m",  "gabung": 1},
+    "M3":  {"basis": "1m",  "gabung": 3},
+    "M5":  {"basis": "5m",  "gabung": 1},
+    "M10": {"basis": "5m",  "gabung": 2},
+    "M15": {"basis": "15m", "gabung": 1},
+    "M20": {"basis": "5m",  "gabung": 4},
+    "M30": {"basis": "30m", "gabung": 1},
+    "H1":  {"basis": "60m", "gabung": 1},
+    "H4":  {"basis": "60m", "gabung": 4},
+    "D1":  {"basis": "1d",  "gabung": 1},
+    "W1":  {"basis": "1wk", "gabung": 1},
+}
+TF_CACHE_TTLS: dict[str, float] = {
+    "M1": M1_CACHE_TTL,
+    "M3": M1_CACHE_TTL * 2,
+    "M5": M5_CACHE_TTL,
+    "M10": M5_CACHE_TTL * 1.5,
+    "M15": INTRADAY_CACHE_TTL,
+    "M20": M5_CACHE_TTL * 2,
+    "M30": INTRADAY_CACHE_TTLS["30m"],
+    "H1": H1_CACHE_TTL,
+    "H4": H1_CACHE_TTL * 2,
+    "D1": HISTORY_CACHE_TTL,
+    "W1": HISTORY_CACHE_TTL * 4,
+}
 # Nilai 1 pip untuk XAUUSD. Default 1 pip = 1.00 poin harga ($1 per troy oz).
 # Broker dengan kuotasi 2 desimal biasanya memakai 0.1 atau 0.01 — sesuaikan
 # lewat env GOLD_PIP_VALUE agar 50 pip = 50 * GOLD_PIP_VALUE poin.
@@ -264,6 +319,95 @@ def fetch_intraday_history(interval: str = "15m") -> list[dict[str, Any]]:
             return rows
         last_exc = RuntimeError(f"Data intraday {interval} kosong dari {url}")
     raise RuntimeError(f"Semua sumber intraday {interval} Yahoo Finance gagal") from last_exc
+
+
+def fetch_weekly_history() -> list[dict[str, Any]]:
+    """Ambil OHLC mingguan GC=F (2 tahun) — sumber bias/zona W1."""
+    cached = _cache_get("history_weekly")
+    if cached is not None:
+        logger.info("Cache histori mingguan dipakai (TTL %ss)", HISTORY_CACHE_TTL)
+        return [dict(row) for row in cached]  # type: ignore[union-attr]
+    last_exc: Exception | None = None
+    for url in YAHOO_WEEKLY_URLS:
+        try:
+            rows = _parse_yahoo_chart(_http_get(url, headers={"User-Agent": USER_AGENT}).json())
+        except Exception as exc:  # noqa: BLE001 - coba sumber berikutnya
+            last_exc = exc
+            logger.warning("Sumber mingguan %s gagal: %s", url, exc)
+            continue
+        if rows:
+            _cache_set("history_weekly", rows, HISTORY_CACHE_TTL * 4)
+            return rows
+        last_exc = RuntimeError(f"Data kosong dari {url}")
+    raise RuntimeError("Semua sumber mingguan Yahoo Finance gagal") from last_exc
+
+
+def _resample_bars(rows: list[dict[str, Any]], gabung: int) -> list[dict[str, Any]]:
+    """Gabungkan `gabung` bar berurutan menjadi satu bar timeframe lebih besar.
+
+    Bar dikelompokkan dari BELAKANG (bar terakhir selalu bar yang baru selesai)
+    dan sisa bar di depan yang tidak cukup satu kelompok dibuang, sehingga
+    candle hasil resample tidak pernah separuh jadi. Bar U: open = open bar
+    pertama, close = close bar terakhir, high/low = maks/min kelompok.
+    """
+    if gabung <= 1 or not rows:
+        return [dict(r) for r in rows]
+    n = (len(rows) // gabung) * gabung
+    if n == 0:
+        return [dict(r) for r in rows]
+    mulai = len(rows) - n
+    if mulai:
+        logger.info("Resample %dx: %d bar awal dibuang (belum genap 1 candle)",
+                    gabung, mulai)
+    hasil: list[dict[str, Any]] = []
+    for i in range(mulai, len(rows), gabung):
+        kelompok = rows[i:i + gabung]
+        bar: dict[str, Any] = {
+            "open": float(kelompok[0]["open"]),
+            "high": max(float(b["high"]) for b in kelompok),
+            "low": min(float(b["low"]) for b in kelompok),
+            "close": float(kelompok[-1]["close"]),
+        }
+        if "date" in kelompok[0]:
+            bar["date"] = kelompok[0]["date"]
+        if "time" in kelompok[-1]:
+            bar["time"] = kelompok[-1]["time"]
+        hasil.append(bar)
+    return hasil
+
+
+def fetch_tf_history(tf: str) -> list[dict[str, Any]]:
+    """Ambil OHLC untuk sembarang label timeframe (M1...W1).
+
+    TF tanpa interval native di Yahoo (M3/M10/M20/H4) dibentuk lewat resample
+    dari basis TF_SPECS. Hasil di-cache per label sehingga matriks zona -> bias
+    tetap cepat pada panggilan berikutnya.
+    """
+    import unified_analysis as ua  # normalisasi label (M5, 5m, 5M -> M5)
+
+    label = ua.normalize_tf(tf)
+    spec = TF_SPECS.get(label)
+    if spec is None:
+        raise ValueError(f"Timeframe tidak didukung: {tf!r}")
+    cache_key = f"tf_{label}"
+    ttl = TF_CACHE_TTLS.get(label, INTRADAY_CACHE_TTL)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        logger.info("Cache %s dipakai (TTL %ss)", label, ttl)
+        return [dict(row) for row in cached]  # type: ignore[union-attr]
+
+    basis = spec["basis"]
+    if basis == "1d":
+        rows = fetch_daily_history()
+    elif basis == "1wk":
+        rows = fetch_weekly_history()
+    else:
+        rows = fetch_intraday_history(basis)
+    hasil = _resample_bars(rows, int(spec["gabung"]))
+    if not hasil:
+        raise RuntimeError(f"Data {label} kosong setelah resample")
+    _cache_set(cache_key, hasil, ttl)
+    return hasil
 
 
 def _parse_yahoo_chart(
@@ -2091,92 +2235,96 @@ def _normalize_all_in_one_mode(mode: str) -> str:
     return "m5" if m in _ALL_IN_ONE_MODES or not m else m
 
 
+def _htf_to_dict(htf) -> dict[str, Any]:
+    """Serialisasi HTFAnalysis (bias timeframe) menjadi dict."""
+    return {
+        "timeframe": htf.timeframe,
+        "vibe": htf.vibe,
+        "fincept": htf.fincept,
+        "director": htf.director,
+        "votes": htf.votes,
+        "bias": htf.bias,
+        "conviction": htf.conviction,
+        "agree": htf.agree,
+    }
+
+
+def _ltf_to_dict(ltf) -> dict[str, Any]:
+    """Serialisasi LTFAnalysis (timeframe zona) menjadi dict."""
+    return {
+        "timeframe": ltf.timeframe,
+        "timeframe_diminta": ltf.wanted,
+        "fallback": ltf.fallback_used,
+        "vibe": ltf.vibe,
+        "quant": ltf.quant,
+        "risk": ltf.risk,
+        "execution": ltf.execution,
+        "zona_bawah": ltf.zona_bawah,
+        "zona_atas": ltf.zona_atas,
+        "entry_limit": ltf.entry_limit,
+        "sl": ltf.sl,
+        "tp1": ltf.tp1,
+        "tp2": ltf.tp2,
+        "lot": ltf.lot,
+        "atr": ltf.atr,
+    }
+
+
 @mcp.tool()
 def get_gold_all_in_one(mode: str = "m5") -> dict[str, Any]:
-    """Analisa lengkap satu mode: core sinyal + SMC + Vibe + Fincept + AutoHedge + zona FUSION.
+    """Analisa lengkap satu mode: 3 repo (Vibe/Fincept/AutoHedge) + SMC.
 
-    mode: "m5" (scalping M5/M15, M1 jika tersedia), "intraday" (H1->M15), "swing" (D1->H1).
-        Sekarang menggunakan unified_analysis.py untuk multi-timeframe + SATU entry zone konfluensi.
+    mode: "m5" (bias M15 -> entry M1), "intraday" (H1 -> M5), "swing" (D1 -> H1).
+    Output: SATU arah + SATU zona entry (5 pip untuk m5) + SL 50 / TP 100-150 pip.
     """
     import unified_analysis
     m = _normalize_all_in_one_mode(mode)
-    # Map mode name ke unified_analysis (m5 -> scalp, intraday -> intraday, swing -> swing)
+    # Map nama mode bot ke mode unified_analysis: m5 -> scalp.
     ua_mode = {"m5": "scalp", "intraday": "intraday", "swing": "swing"}.get(m, m)
 
     # Fetch market data multi-timeframe
     spot0 = _clean(fetch_gold_price_raw())["price"]
     hist: dict[str, list[dict[str, Any]]] = {}
-    # HTF data
-    htf_tf = {
-        "scalp": "M15",
-        "intraday": "H1",
-        "swing": "D1",
-    }[ua_mode]
-    ltf_tf = {
-        "scalp": "M5",
-        "intraday": "M5",
-        "swing": "H1",
-    }[ua_mode]
+    # HTF = penentu bias, LTF = penentu zona entry (scalp: M15 -> M1).
+    htf_tf = {"scalp": "M15", "intraday": "H1", "swing": "D1"}[ua_mode]
+    ltf_tf = {"scalp": "M1", "intraday": "M5", "swing": "H1"}[ua_mode]
 
-    # Get HTF and LTF history
-    if htf_tf in ("H1", "M15"):
-        hist[htf_tf] = fetch_intraday_history("60m" if htf_tf == "H1" else "15m")
-    else:
-        hist[htf_tf] = fetch_daily_history()
+    def _load(label: str, tf: str) -> None:
+        """Muat satu timeframe ke `hist` (gagal -> dicatat di log, tidak fatal)."""
+        interval = {"M1": "1m", "M5": "5m", "M15": "15m", "H1": "60m"}.get(tf)
+        try:
+            hist[tf] = fetch_intraday_history(interval) if interval else fetch_daily_history()
+        except Exception as exc:  # noqa: BLE001 - timeframe ini opsional
+            logger.warning("Data %s (%s) gagal dimuat: %s", label, tf, exc)
 
-    if ltf_tf in ("H1", "M15"):
-        hist[ltf_tf] = fetch_intraday_history("60m" if ltf_tf == "H1" else "15m")
-    else:
-        hist[ltf_tf] = fetch_intraday_history("5m")
+    _load("bias", htf_tf)
+    _load("entry", ltf_tf)
+    # M5 tetap dimuat untuk m5 sebagai cadangan bila M1 tidak tersedia.
+    if ua_mode == "scalp":
+        _load("cadangan", "M5")
+    if not hist:
+        raise RuntimeError("Semua sumber data OHLC gagal dimuat.")
 
-    # Tambahan M1 untuk scalping jika tersedia
-    try:
-        hist["M1"] = fetch_intraday_history("1m")
-    except Exception:
-        pass  # M1 tidak selalu tersedia
-
-    # Offset semua history ke spot
-    for tf, h in hist.items():
-        off = _spot_offset(spot0, [float(r["close"]) for r in h]) if h else 0.0
-        for r in h:
+    # Offset semua history ke harga spot saat ini
+    for _tf, _rows in hist.items():
+        off = _spot_offset(spot0, [float(r["close"]) for r in _rows]) if _rows else 0.0
+        for r in _rows:
             for k in ("open", "high", "low", "close"):
                 if k in r:
                     r[k] = float(r[k]) + off
 
-    # Jalankan unified analysis
+    # Jalankan analisa terpadu 3 repo (spot diteruskan agar tidak 0/negatif)
     analyzer = unified_analysis.UnifiedAnalyzer()
-    result = analyzer.analyze(ua_mode, hist)
-
-    # Convert UnifiedAnalysisResult ke dict
-    def _htf_to_dict(htf: unified_analysis.HTFAnalysis) -> dict:
-        return {
-            "timeframe": htf.timeframe,
-            "vibe": htf.vibe,
-            "fincept": htf.fincept,
-            "director": htf.director,
-            "bias": htf.bias,
-            "conviction": htf.conviction,
-        }
-
-    def _ltf_to_dict(ltf: unified_analysis.LTFAnalysis) -> dict:
-        return {
-            "timeframe": ltf.timeframe,
-            "vibe": ltf.vibe,
-            "quant": ltf.quant,
-            "risk": ltf.risk,
-            "execution": ltf.execution,
-            "entry_limit": ltf.entry_limit,
-            "sl": ltf.sl,
-            "tp1": ltf.tp1,
-            "tp2": ltf.tp2,
-            "lot": ltf.lot,
-        }
+    result = analyzer.analyze(ua_mode, hist, spot=spot0)
 
     return {
         "mode": m,
         "spot_price": result.spot,
         "timestamp": result.timestamp,
         "direction": result.direction,
+        "timeframe_bias": result.htf.timeframe,
+        "timeframe_entry": result.ltf.timeframe,
+        "zona_entry": {"bawah": result.zona_bawah, "atas": result.zona_atas},
         "entry_limit": result.entry_limit,
         "stop_loss": result.sl,
         "take_profit_1": result.tp1,
@@ -2221,6 +2369,151 @@ def get_gold_all_in_one_html(mode: str = "m5") -> str:
         sections.append(get_gold_smc_analysis_html())
     sections.append(f"⚠️ {DISCLAIMER}")
     return "\n\n".join(sections)
+
+
+# ============================== matriks zona -> bias (pilih TF + gaya)
+# Alur bot: /start -> tombol timeframe (M1...H4) -> tombol gaya (scalping /
+# intraday / swing) -> sinyal disusun di sini. Bias selalu dari timeframe
+# peta (M1<-M15, M5<-H1, dst — lihat unified_analysis.ZONE_BIAS_BY_TF),
+# zona dari timeframe pilihan, profil risiko dari gaya (STYLE_PRESETS).
+
+def _tf_untuk_sinyal(zone_tf: str, style: str) -> list[str]:
+    """Daftar TF yang dimuat: zona + bias peta + saringan + cadangan terdekat.
+
+    Cadangan penting agar sinyal tetap keluar saat satu sumber data gagal
+    (mis. M1 kosong -> zona jatuh ke M3/M5, M15 kosong -> bias jatuh ke M30).
+    """
+    import unified_analysis as ua
+
+    zone = ua.normalize_zone_tf(zone_tf)
+    spec = ua.STYLE_PRESETS[ua.normalize_style(style)]
+    bias = ua.zone_bias_tf(zone)
+    urut: list[str] = [zone, bias]
+    urut += [tf for tf in ua.zone_priority(zone)[1:2] if tf not in urut]
+    urut += [tf for tf in ua.bias_priority(zone)[1:2] if tf not in urut]
+    saringan = spec.get("filter_tf")
+    if saringan and saringan not in urut:
+        urut.append(saringan)
+    return urut
+
+
+def build_mtf_signal(zone_tf: str = "M5", style: str = "intraday") -> dict[str, Any]:
+    """Sinyal untuk kombinasi timeframe ZONA + GAYA yang dipilih pengguna.
+
+    zone_tf : "M1"..."H4" (tempat zona entry dibaca).
+    style   : "scalping" / "intraday" / "swing".
+    """
+    import unified_analysis as ua
+
+    zone = ua.normalize_zone_tf(zone_tf)
+    style_key = ua.normalize_style(style)
+    spec = ua.STYLE_PRESETS[style_key]
+    bias_peta = ua.zone_bias_tf(zone)
+
+    spot0 = _clean(fetch_gold_price_raw())["price"]
+    hist: dict[str, list[dict[str, Any]]] = {}
+    gagal: list[str] = []
+    for tf in _tf_untuk_sinyal(zone, style_key):
+        try:
+            rows = fetch_tf_history(tf)
+        except Exception as exc:  # noqa: BLE001 - TF ini opsional/cadangan
+            gagal.append(f"{tf}: {exc}")
+            logger.warning("TF %s (%s/%s) gagal dimuat: %s", tf, zone, style_key, exc)
+            continue
+        # Selaraskan seri futures ke harga spot saat ini.
+        off = _spot_offset(spot0, [float(r["close"]) for r in rows]) if rows else 0.0
+        for r in rows:
+            for k in ("open", "high", "low", "close"):
+                if k in r:
+                    r[k] = float(r[k]) + off
+        hist[tf] = rows
+    if not hist:
+        raise RuntimeError("Semua sumber data OHLC gagal dimuat.")
+    if not any(tf in hist for tf in ua.zone_priority(zone)):
+        raise RuntimeError(
+            f"Data zona {zone} tidak tersedia. Gagal: {'; '.join(gagal) or '-'}")
+
+    try:
+        result = ua.UnifiedAnalyzer().analyze_zone(zone, style_key, hist, spot=spot0)
+    except ValueError as exc:  # data OHLC kurang lengkap
+        raise RuntimeError(
+            f"Data OHLC kurang untuk zona {zone} gaya {spec['label']}: {exc}") from exc
+
+    rasio = f"{ua.zone_ratio(zone, result.htf.timeframe):g}×"
+    return {
+        "mode": style_key,
+        "style": style_key,
+        "style_label": spec["label"],
+        "timeframe_zone": zone,
+        "timeframe_bias_peta": bias_peta,
+        "rasio_zona_bias": rasio,
+        "timeframe_zone_terpakai": result.ltf.timeframe,
+        "timeframe_bias": result.htf.timeframe,
+        "spot_price": result.spot,
+        "timestamp": result.timestamp,
+        "direction": result.direction,
+        "wait_reason": result.wait_reason,
+        "zona_entry": {"bawah": result.zona_bawah, "atas": result.zona_atas},
+        "entry_limit": result.entry_limit,
+        "stop_loss": result.sl,
+        "take_profit_1": result.tp1,
+        "take_profit_2": result.tp2,
+        "lot": result.lot,
+        "confidence": result.confidence,
+        "valid_hours": result.valid_hours,
+        "filter_timeframe": result.filter_tf,
+        "filter_bias": result.filter_bias,
+        "confluence_factors": result.confluence_factors,
+        "htf_analysis": _htf_to_dict(result.htf),
+        "ltf_analysis": _ltf_to_dict(result.ltf),
+        "timeframes_dimuat": sorted(hist),
+        "timeframes_gagal": gagal,
+        "report": result.report,
+        "disclaimer": DISCLAIMER,
+    }
+
+
+@mcp.tool()
+def get_gold_timeframes() -> dict[str, Any]:
+    """Menu pilihan timeframe + gaya trading untuk keyboard bot Telegram.
+
+    Mengembalikan daftar TF zona beserta bias pembentuknya (M1<-M15, M5<-H1,
+    dst) dan tiga gaya (scalping/intraday/swing) supaya tombol di bot selalu
+    sinkron dengan logika analisa di server.
+    """
+    import unified_analysis as ua
+
+    menu = ua.timeframe_menu()
+    menu["peta_zona_bias"] = {z: ua.ZONE_BIAS_BY_TF[z] for z in ua.ZONE_TF_ORDER}
+    menu["timeframe_urutan"] = list(ua.ZONE_TF_ORDER)
+    menu["style_urutan"] = list(ua.STYLE_ORDER)
+    menu["disclaimer"] = DISCLAIMER
+    return menu
+
+
+@mcp.tool()
+def get_gold_mtf_signal(zone_tf: str = "M5", style: str = "intraday") -> dict[str, Any]:
+    """Sinyal multi-timeframe matriks zona -> bias (dict).
+
+    zone_tf: "M1", "M3", "M5", "M10", "M15", "M20", "M30", "H1", "H4".
+    style  : "scalping", "intraday", "swing".
+
+    Hasil: SATU arah + SATU zona entry pada timeframe pilihan, dengan bias dari
+    timeframe peta (contoh zona M1 -> bias M15, zona M5 -> bias H1), SL/TP
+    adaptif ATR sesuai gaya, plus saringan tren (D1 untuk intraday, W1 untuk
+    swing).
+    """
+    return build_mtf_signal(zone_tf, style)
+
+
+@mcp.tool()
+def get_gold_mtf_signal_html(zone_tf: str = "M5", style: str = "intraday") -> str:
+    """Laporan sinyal matriks zona -> bias, teks siap-kirim Telegram."""
+    a = get_gold_mtf_signal(zone_tf, style)
+    return a.get("report") or (
+        f"⚠️ {a['style_label']} zona {a['timeframe_zone']} — {a['direction']} "
+        f"(spot {a['spot_price']:,.2f})\n⚠️ {DISCLAIMER}"
+    )
 
 
 if __name__ == "__main__":

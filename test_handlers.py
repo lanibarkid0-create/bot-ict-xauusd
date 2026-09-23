@@ -1,7 +1,8 @@
 """
 Test handler bot TANPA Telegram/token.
 
-Memanggil langsung handler reply_price, reply_signal & reply_scalp dengan Update
+Memanggil langsung handler reply_price, reply_signal, reply_scalp, alur
+tombol inline (/start -> zona TF -> gaya -> sinyal MTF) dengan Update
 palsu, sehingga membuktikan alur: handler → MCP tool → teks balasan.
 
     python test_handlers.py
@@ -10,6 +11,7 @@ palsu, sehingga membuktikan alur: handler → MCP tool → teks balasan.
 import asyncio
 import contextlib
 import io
+import json
 import os
 import sys
 from datetime import datetime
@@ -18,21 +20,24 @@ os.environ.setdefault("BOT_TOKEN", "dummy:token-for-test")
 sys.stdout.reconfigure(encoding="utf-8")
 
 import bot_telegram  # noqa: E402
+import unified_analysis as ua  # noqa: E402
 from telegram import Chat, Message, User  # noqa: E402
 from telegram import Update as TgUpdate  # noqa: E402
 from telegram.error import BadRequest  # noqa: E402
 
 
 class FakeMessage:
-    """Tiruan Update.message yang menangkap teks + parse_mode balasan."""
+    """Tiruan Update.message yang menangkap teks + parse_mode + keyboard."""
 
     def __init__(self, fail_parse: bool = False) -> None:
         self.sent: list[str] = []
         self.parse_modes: list[str | None] = []
+        self.markups: list = []
         # Bila True, panggilan dengan parse_mode akan ditolak seperti Telegram.
         self.fail_parse = fail_parse
 
-    async def reply_text(self, text: str, parse_mode: str | None = None, **_kw) -> None:
+    async def reply_text(self, text: str, parse_mode: str | None = None,
+                         reply_markup=None, **_kw) -> None:
         if self.fail_parse and parse_mode:
             raise BadRequest(
                 "Can't parse entities: can't find end of the entity "
@@ -40,6 +45,7 @@ class FakeMessage:
             )
         self.sent.append(text)
         self.parse_modes.append(parse_mode)
+        self.markups.append(reply_markup)
 
     async def send_action(self, *_a, **_kw) -> None:
         pass
@@ -49,9 +55,29 @@ class FakeMessage:
         return self
 
 
+class FakeCallbackQuery:
+    """Tiruan CallbackQuery: answer + edit_message_text terekam di memori."""
+
+    def __init__(self, data: str, message: "FakeMessage | None" = None) -> None:
+        self.data = data
+        self.message = message if message is not None else FakeMessage()
+        self.answered: list[str | None] = []
+        self.edits: list[str] = []
+        self.edit_markups: list = []
+
+    async def answer(self, text: str | None = None, **_kw) -> None:
+        self.answered.append(text)
+
+    async def edit_message_text(self, text: str, parse_mode: str | None = None,
+                                reply_markup=None, **_kw) -> None:
+        self.edits.append(text)
+        self.edit_markups.append(reply_markup)
+
+
 class FakeUpdate:
-    def __init__(self, fail_parse: bool = False) -> None:
+    def __init__(self, fail_parse: bool = False, callback_query=None) -> None:
         self.message = FakeMessage(fail_parse=fail_parse)
+        self.callback_query = callback_query
 
 
 _results: list[tuple[str, bool]] = []
@@ -144,7 +170,7 @@ async def main() -> None:
     )
     check("reply_swing kirim teks SWING + zona POI + Markdown", swing_ok)
 
-    # 5d) Engine baru 3-repo: vibe / fincept / hedge / fusion (mock _call_mcp).
+    # 5d) Engine 3-repo dipanggil lewat _reply_tool generik (mock _call_mcp).
     _orig_call = bot_telegram._call_mcp
 
     async def _fake_call(tool: str, _args: dict | None = None) -> str:
@@ -152,16 +178,20 @@ async def main() -> None:
 
     bot_telegram._call_mcp = _fake_call
     try:
-        for fn_name, tool, key in [
-            ("reply_vibe", "get_gold_vibe_analysis_html", "VIBE"),
-            ("reply_fincept", "get_gold_fincept_analytics_html", "FINCEPT"),
-            ("reply_hedge", "get_gold_autohedge_plan_html", "HEDGE"),
-            ("reply_fusion", "get_gold_fusion_signal_html", "FUSION"),
+        for tool in [
+            "get_gold_vibe_analysis_html",
+            "get_gold_fincept_analytics_html",
+            "get_gold_autohedge_plan_html",
+            "get_gold_fusion_signal_html",
         ]:
             u = FakeUpdate()
-            await getattr(bot_telegram, fn_name)(u, None)
-            ok = bool(u.message.sent) and tool in u.message.sent[-1]
-            check(f"{fn_name} panggil {tool} + Markdown", ok)
+            await bot_telegram._reply_tool(u, tool, "uji engine")
+            ok = (
+                bool(u.message.sent)
+                and tool in u.message.sent[-1]
+                and u.message.parse_modes[-1] == "Markdown"
+            )
+            check(f"_reply_tool {tool} + Markdown", ok)
     finally:
         bot_telegram._call_mcp = _orig_call
 
@@ -244,6 +274,110 @@ async def main() -> None:
         )
     check("on_error biasa -> tidak stop polling",
           not fake_app2.stopped and "boom biasa" in err_buf.getvalue())
+
+    # 9) Alur interaktif: /start -> tombol zona TF -> tombol gaya -> sinyal MTF.
+    peta = {z: ua.ZONE_BIAS_BY_TF[z] for z in ua.ZONE_TF_ORDER}
+    check("peta cadangan bot sinkron dengan unified_analysis.ZONE_BIAS_BY_TF",
+          dict(bot_telegram._PETA_FALLBACK) == peta)
+    gaya_bot = {k: (ik, lb, j) for k, ik, lb, j in bot_telegram._GAYA_FALLBACK}
+    check("gaya cadangan bot sinkron dengan unified_analysis.STYLE_PRESETS",
+          gaya_bot == {
+              k: (ua.STYLE_PRESETS[k]["icon"], ua.STYLE_PRESETS[k]["label"],
+                  ua.STYLE_PRESETS[k]["valid_hours"])
+              for k in ua.STYLE_ORDER})
+
+    menu_json = json.dumps({
+        "timeframes": [
+            {"kode": z, "bias": b, "peta": f"{z} → {b}"} for z, b in peta.items()],
+        "styles": [
+            {"kode": k, "ikon": ua.STYLE_PRESETS[k]["icon"],
+             "label": ua.STYLE_PRESETS[k]["label"],
+             "deskripsi": ua.STYLE_PRESETS[k]["deskripsi"],
+             "valid_hours": ua.STYLE_PRESETS[k]["valid_hours"]}
+            for k in ua.STYLE_ORDER],
+    })
+    _panggilan: list[tuple[str, dict]] = []
+
+    async def _fake_mtf(tool: str, args: dict | None = None) -> str:
+        _panggilan.append((tool, args or {}))
+        if tool == "get_gold_timeframes":
+            return menu_json
+        if tool == "get_gold_mtf_signal_html":
+            return (f"*SINYAL {args['zone_tf']} {args['style']}*\n\n"
+                    "zona & SL/TP contoh untuk pengujian")
+        raise RuntimeError(f"tool tak dikenal: {tool}")
+
+    _orig9 = bot_telegram._call_mcp
+    bot_telegram._call_mcp = _fake_mtf
+    try:
+        # /start -> grid 9 zona TF (label M1 <- M15, callback tf:<TF>).
+        u = FakeUpdate()
+        await bot_telegram.cmd_start(u, None)
+        kb = u.message.markups[-1]
+        datar = [b.callback_data for row in kb.inline_keyboard for b in row]
+        check("/start: 9 tombol zona TF sesuai peta + Markdown",
+              datar == [f"tf:{z}" for z in peta]
+              and len(kb.inline_keyboard) == 3
+              and u.message.parse_modes[-1] == "Markdown"
+              and any(b.text == "M1 ← M15"
+                      for row in kb.inline_keyboard for b in row))
+
+        # klik zona M5 -> teks zona+bias & 3 tombol gaya + tombol kembali.
+        cq = FakeCallbackQuery("tf:M5")
+        await bot_telegram.on_callback(FakeUpdate(callback_query=cq), None)
+        gaya_kb = cq.edit_markups[-1]
+        gaya_datar = [b.callback_data for row in gaya_kb.inline_keyboard for b in row]
+        check("klik zona M5 -> 3 tombol gaya + kembali + teks bias H1",
+              gaya_datar == ["sty:M5:scalping", "sty:M5:intraday",
+                             "sty:M5:swing", "menu"]
+              and "ZONA M5" in cq.edits[-1] and "H1" in cq.edits[-1])
+
+        # klik gaya -> get_gold_mtf_signal_html(zone_tf, style) + laporan terkirim.
+        cq2 = FakeCallbackQuery("sty:M5:intraday")
+        await bot_telegram.on_callback(FakeUpdate(callback_query=cq2), None)
+        mtf = [a for t, a in _panggilan if t == "get_gold_mtf_signal_html"]
+        laporan = cq2.message.sent[-1] if cq2.message.sent else ""
+        ulang_kb = cq2.message.markups[-1]
+        ulang_datar = [b.callback_data for row in ulang_kb.inline_keyboard for b in row]
+        check("klik gaya -> sinyal MTF terkirim + tombol ulangi/ganti",
+              mtf == [{"zone_tf": "M5", "style": "intraday"}]
+              and "SINYAL M5 intraday" in laporan
+              and ulang_datar == ["sty:M5:intraday", "menu"]
+              and bool(cq2.answered))
+
+        # tombol kembali -> grid zona lagi.
+        cq3 = FakeCallbackQuery("menu")
+        await bot_telegram.on_callback(FakeUpdate(callback_query=cq3), None)
+        balik = [b.callback_data
+                 for row in cq3.edit_markups[-1].inline_keyboard for b in row]
+        check("tombol kembali -> menu 9 zona TF lagi",
+              balik == [f"tf:{z}" for z in peta])
+
+        # pilihan tidak valid -> kembali ke menu, tidak crash.
+        cq4 = FakeCallbackQuery("sty:M99:scalping")
+        await bot_telegram.on_callback(FakeUpdate(callback_query=cq4), None)
+        check("zona tak dikenal -> kembali ke menu zona",
+              cq4.edit_markups[-1] is not None
+              and len(cq4.edit_markups[-1].inline_keyboard) == 3)
+    finally:
+        bot_telegram._call_mcp = _orig9
+
+    # 9b) Jalur gagal: server mati -> pesan jelas + tombol gaya utk coba lagi.
+    async def _gagal_mtf(tool: str, args: dict | None = None) -> str:
+        raise RuntimeError("jaringan mati [Errno 11001]")
+
+    bot_telegram._call_mcp = _gagal_mtf
+    try:
+        cq5 = FakeCallbackQuery("sty:H1:swing")
+        await bot_telegram.on_callback(FakeUpdate(callback_query=cq5), None)
+        kb_err = cq5.edit_markups[-1]
+        retry = [b.callback_data for row in kb_err.inline_keyboard for b in row]
+        check("sinyal gagal -> pesan Gagal + tombol gaya utk coba lagi",
+              "Gagal" in cq5.edits[-1]
+              and retry == ["sty:H1:scalping", "sty:H1:intraday",
+                            "sty:H1:swing", "menu"])
+    finally:
+        bot_telegram._call_mcp = _orig9
 
     failed = [n for n, ok in _results if not ok]
     print(f"\n=== {len(_results) - len(failed)}/{len(_results)} CEK LULUS ===")

@@ -26,12 +26,20 @@ def sharpe_var(closes: list[float]) -> dict:
 
 
 def dcf_gap(spot: float, closes: list[float], growth: float = 0.03, discount: float = 0.08) -> dict:
-    """Value-gap sederhana: fair = rata2 close * (1+g)/(r-g) dinormalisasi."""
-    if not closes or discount <= growth:
-        return {"fair_value": round(spot, 2), "gap_pct": 0.0}
-    avg = sum(closes[-20:]) / min(20, len(closes))
-    fair = avg * (1 + growth) / (discount - growth) / 20  # skala wajar utk komoditas
-    gap = round((spot - fair) / fair * 100, 2) if fair else 0.0
+    """Value-gap sederhana untuk komoditas: fair value = rata-rata 20 close
+    terakhir (jangkar mean-reversion), gap = (spot - fair) / fair * 100.
+
+    Parameter growth/discount dipertahankan untuk kompatibilitas API; pada
+    komoditas tanpa arus kas, harga wajar lebih tepat dijangkar ke rata-rata
+    pergerakan terakhir, bukan model DCF penuh.
+    """
+    if not closes:
+        return {"fair_value": round(spot, 2), "gap_pct": 0.0, "verdict": "FAIR"}
+    window = closes[-20:]
+    fair = sum(window) / len(window)
+    if fair <= 0:
+        return {"fair_value": round(spot, 2), "gap_pct": 0.0, "verdict": "FAIR"}
+    gap = round((spot - fair) / fair * 100, 2)
     verdict = "OVERVALUED" if gap > 2 else ("UNDERVALUED" if gap < -2 else "FAIR")
     return {"fair_value": round(fair, 2), "gap_pct": gap, "verdict": verdict}
 

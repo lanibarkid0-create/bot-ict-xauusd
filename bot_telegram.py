@@ -25,10 +25,11 @@ import time
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     TypeHandler,
@@ -292,17 +293,19 @@ async def _shutdown_bridge(_app) -> None:
         await _bridge.stop()
 
 
-async def _safe_reply(message, text: str, parse_mode: str | None = "Markdown") -> None:
+async def _safe_reply(message, text: str, parse_mode: str | None = "Markdown",
+                      reply_markup=None) -> None:
     """Kirim balasan; kalau Telegram menolak formatting, kirim ulang sebagai teks biasa."""
     try:
-        await message.reply_text(text, parse_mode=parse_mode)
+        await message.reply_text(
+            text, parse_mode=parse_mode, reply_markup=reply_markup)
     except BadRequest as exc:
         if "parse" in str(exc).lower() or "entit" in str(exc).lower():
             print(
                 f"Format {parse_mode} ditolak Telegram, kirim sebagai teks biasa.",
                 file=sys.stderr,
             )
-            await message.reply_text(text)
+            await message.reply_text(text, reply_markup=reply_markup)
         else:
             raise
 
@@ -446,19 +449,206 @@ async def reply_swing_all(update: Update, _ctx) -> None:
     await reply_all(update, "swing")
 
 
-async def cmd_start(update: Update, _ctx) -> None:
-    await update.message.reply_text(
-        "🤖 Halo! Analisa XAUUSD gabungan 3 engine (Vibe-Trading, Fincept, AutoHedge + SMC).\n\n"
-        "⚡ /m5 — SCALPING lengkap: zona konfluensi 3 repo + trigger M5 + momentum M15\n"
-        " + vibe/fincept/hedge (gabungan /signal, /scalp, /vibe)\n\n"
-        "📈 /intraday — INTRADAY lengkap: zona konfluensi + H1→M15 (OB/FVG/sweep) + SMC\n"
-        " + vibe/fincept/hedge (gabungan /smc)\n\n"
-        "🌊 /swing — SWING lengkap: zona konfluensi + D1→H1 + SMC + vibe/fincept/hedge\n\n"
-        "💵 /harga — harga XAUUSD saat ini\n\n"
-        "Alias lama masih jalan: /signal /analisa /scalp /scalping /scalp5 /smc /smct\n"
-        "/intra /daytrade /fincept /vibe /hedge /autohedge /fusion /fusi\n"
-        "Atau cukup ketik 'harga emas'."
+# ================================================== menu zona TF -> gaya
+# Alur interaktif: /start -> tombol zona (M1...H4) -> tombol gaya
+# (scalping / intraday / swing) -> sinyal get_gold_mtf_signal_html dengan
+# zona dari TF pilihan dan arah dari peta bias server (M1<-M15, M5<-H1, dst).
+# Menu diambil dari server (get_gold_timeframes) supaya tombol selalu sinkron
+# dengan logika analisa; bila MCP gagal, dipakai peta cadangan statis di
+# bawah ini — wajib sama dengan unified_analysis.ZONE_BIAS_BY_TF (diuji
+# test_handlers).
+_PETA_FALLBACK: tuple[tuple[str, str], ...] = (
+    ("M1", "M15"), ("M3", "M30"), ("M5", "H1"), ("M10", "H1"),
+    ("M15", "H4"), ("M20", "H4"), ("M30", "H4"), ("H1", "D1"), ("H4", "D1"),
+)
+_GAYA_FALLBACK: tuple[tuple[str, str, str, float], ...] = (
+    # (kode, ikon, label, valid_hours) — ikuti unified_analysis.STYLE_PRESETS.
+    ("scalping", "⚡", "SCALPING", 2.0),
+    ("intraday", "📈", "INTRADAY", 12.0),
+    ("swing", "🌊", "SWING", 72.0),
+)
+
+
+def _menu_fallback() -> dict:
+    """Menu statis bila server MCP gagal — tombol tetap muncul, alur tetap jalan."""
+    return {
+        "timeframes": [
+            {"kode": z, "bias": b, "peta": f"{z} → {b}", "rasio": ""}
+            for z, b in _PETA_FALLBACK
+        ],
+        "styles": [
+            {"kode": k, "ikon": ik, "label": lb, "deskripsi": "", "valid_hours": j}
+            for k, ik, lb, j in _GAYA_FALLBACK
+        ],
+    }
+
+
+async def _load_menu() -> dict:
+    """Ambil menu TF + gaya dari MCP; fallback ke peta statis bila gagal."""
+    try:
+        menu = json.loads(await _call_mcp("get_gold_timeframes"))
+        if (isinstance(menu, dict) and menu.get("timeframes")
+                and menu.get("styles")):
+            return menu
+    except Exception as exc:  # noqa: BLE001 - tombol wajib tetap muncul
+        print(f"⚠️ get_gold_timeframes gagal ({exc}); pakai menu statis.",
+              file=sys.stderr)
+    return _menu_fallback()
+
+
+def _kb_timeframes(menu: dict) -> InlineKeyboardMarkup:
+    """Grid 3 kolom: tombol zona TF beserta bias pembentuknya (M1 <- M15)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    baris: list[InlineKeyboardButton] = []
+    for tf in menu["timeframes"]:
+        baris.append(InlineKeyboardButton(
+            f"{tf['kode']} ← {tf['bias']}", callback_data=f"tf:{tf['kode']}"))
+        if len(baris) == 3:
+            rows.append(baris)
+            baris = []
+    if baris:
+        rows.append(baris)
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_gaya(tf: str, menu: dict) -> InlineKeyboardMarkup:
+    """Tombol gaya untuk zona terpilih + tombol kembali ke peta TF."""
+    rows = [[
+        InlineKeyboardButton(
+            f"{s.get('ikon', '🎯')} {s['label']}",
+            callback_data=f"sty:{tf}:{s['kode']}"),
+    ] for s in menu["styles"]]
+    rows.append([InlineKeyboardButton("◀️ Ubah timeframe", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_ulang(tf: str, gaya: str) -> InlineKeyboardMarkup:
+    """Tombol di bawah laporan sinyal: ulangi atau ganti pilihan."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔁 Ulangi", callback_data=f"sty:{tf}:{gaya}"),
+        InlineKeyboardButton("◀️ Ganti TF", callback_data="menu"),
+    ]])
+
+
+def _teks_menu() -> str:
+    """Teks sapaan /start (Markdown) di atas tombol zona TF."""
+    return (
+        "🧭 *PILIH ZONA TIMEFRAME*\n"
+        "📐 Matriks zona → bias: M1←M15 · M5←H1 · M15←H4 · H1←D1 · H4←D1\n\n"
+        "1️⃣ Tekan salah satu zona di bawah (M1…H4).\n"
+        "2️⃣ Pilih gaya: ⚡ scalping / 📈 intraday / 🌊 swing.\n"
+        "3️⃣ Sinyal keluar sesuai zona & gaya — entry di zona TF pilihan, "
+        "arah dari TF bias-nya.\n\n"
+        "Alias lama masih jalan: /m5 /intraday /swing /harga "
+        "— atau ketik 'harga emas'."
     )
+
+
+def _bias_dari_menu(tf: str, menu: dict) -> str:
+    """Bias pembentuk zona sesuai peta server (fallback '-')."""
+    return next(
+        (t.get("bias", "-") for t in menu["timeframes"] if t["kode"] == tf), "-")
+
+
+def _teks_gaya(tf: str, menu: dict) -> str:
+    """Teks langkah 2: zona terpilih + daftar gaya beserta profil risikonya."""
+    bias = _bias_dari_menu(tf, menu)
+    baris = [f"🎯 *ZONA {tf}* ← bias *{bias}*", "", "_Pilih gaya trading:_"]
+    for s in menu["styles"]:
+        jam = s.get("valid_hours")
+        info = f" · order {jam:g} jam" if isinstance(jam, (int, float)) else ""
+        desc = s.get("deskripsi") or ""
+        baris.append(
+            f"{s.get('ikon', '🎯')} *{s['label']}*{info}"
+            + (f"\n    {desc}" if desc else ""))
+    baris.append(
+        "\n⏱ Lebar zona, SL/TP & masa berlaku order mengikuti gaya yang "
+        "dipilih; arah mengikuti zona TF ini.")
+    return "\n".join(baris)
+
+
+async def _edit(query, teks: str, markup) -> None:
+    """Edit pesan tombol; toleran terhadap Markdown gagal & 'not modified'."""
+    try:
+        await query.edit_message_text(
+            teks, parse_mode="Markdown", reply_markup=markup)
+    except BadRequest as exc:
+        pesan = str(exc).lower()
+        if "not modified" in pesan:
+            return
+        if "parse" in pesan or "entit" in pesan:
+            with contextlib.suppress(BadRequest):
+                await query.edit_message_text(teks, reply_markup=markup)
+            return
+        raise
+    except Exception as exc:  # noqa: BLE001 - jangan crash handler callback
+        print(f"⚠️ edit pesan tombol gagal: {exc}", file=sys.stderr)
+
+
+async def _kirim_sinyal(query, tf: str, gaya: str, menu: dict) -> None:
+    """Ambil sinyal MTF dari server lalu kirim laporannya ke chat."""
+    label = gaya.upper()
+    await _edit(
+        query,
+        f"⏳ Menganalisa zona *{tf}* gaya *{label}*…\n"
+        "Data diambil dari server, mohon tunggu sebentar.", None)
+    try:
+        teks = await _call_mcp(
+            "get_gold_mtf_signal_html", {"zone_tf": tf, "style": gaya})
+    except Exception as exc:  # noqa: BLE001 - tawarkan tombol coba lagi
+        await _edit(
+            query,
+            f"⚠️ Gagal menyusun sinyal zona {tf} {label}: {exc}\n\n"
+            "Tekan tombol di bawah untuk mencoba lagi.",
+            _kb_gaya(tf, menu))
+        return
+    await _edit(query, f"✅ *Sinyal zona {tf}* — gaya *{label}* 👇", None)
+    potongan = _split_chunks(teks)
+    for i, potong in enumerate(potongan):
+        await _safe_reply(
+            query.message, potong,
+            reply_markup=_kb_ulang(tf, gaya) if i == len(potongan) - 1 else None)
+
+
+async def on_callback(update: Update, _ctx) -> None:
+    """Tombol inline: pilih zona TF -> pilih gaya -> kirim sinyal MTF."""
+    query = update.callback_query
+    if query is None:
+        return
+    data = (query.data or "").strip()
+    with contextlib.suppress(Exception):
+        await query.answer()  # hilangkan spinner di tombol
+    try:
+        menu = await _load_menu()
+        if data == "menu" or not data:
+            await _edit(query, _teks_menu(), _kb_timeframes(menu))
+        elif data.startswith("tf:"):
+            tf = data[3:]
+            if not any(t["kode"] == tf for t in menu["timeframes"]):
+                await _edit(query, f"⚠️ Zona {tf} tidak dikenal.",
+                            _kb_timeframes(menu))
+                return
+            await _edit(query, _teks_gaya(tf, menu), _kb_gaya(tf, menu))
+        elif data.startswith("sty:"):
+            _, tf, gaya = (data.split(":", 2) + ["", ""])[:3]
+            kode_tf = {t["kode"] for t in menu["timeframes"]}
+            kode_gaya = {s["kode"] for s in menu["styles"]}
+            if tf not in kode_tf or gaya not in kode_gaya:
+                await _edit(query, "⚠️ Pilihan tidak dikenal.",
+                            _kb_timeframes(menu))
+                return
+            await _kirim_sinyal(query, tf, gaya, menu)
+    except Exception as exc:  # noqa: BLE001 - jangan crash bot
+        print(f"⚠️ callback {data!r} gagal: {exc}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            await query.answer(f"⚠️ Gagal: {exc}", show_alert=True)
+
+
+async def cmd_start(update: Update, _ctx) -> None:
+    """Sapaan + tombol pilihan zona TF (alur: zona -> gaya -> sinyal)."""
+    menu = await _load_menu()
+    await _safe_reply(
+        update.message, _teks_menu(), reply_markup=_kb_timeframes(menu))
 
 
 async def cmd_price(update: Update, _ctx) -> None:
@@ -586,6 +776,8 @@ def _build_app() -> "object":
         app.add_handler(CommandHandler(_alias, cmd_intraday))
     for _alias in ("swing", "hedge", "autohedge", "fusion", "fusi"):
         app.add_handler(CommandHandler(_alias, cmd_swing))
+    # Tombol inline /start: zona TF -> gaya -> sinyal MTF.
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_price))
     return app
 

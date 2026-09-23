@@ -93,12 +93,17 @@ def vibe_analyze(history: list[dict], spot: float) -> dict:
     bt = backtest_ema_cross(closes)
     score = 50.0
     reasons = []
-    if e9 > e21:
+    # Deadband: selisih < 5% ATR dianggap belum ada momentum (pasar datar),
+    # supaya pasar sideways tidak salah dibaca SELL/BUY.
+    amb = max(atr * 0.05, 1e-9)
+    if e9 - e21 > amb:
         score += 12
         reasons.append(f"EMA9 {e9:,.2f} > EMA21 {e21:,.2f} (momentum naik)")
-    else:
+    elif e21 - e9 > amb:
         score -= 12
         reasons.append(f"EMA9 {e9:,.2f} < EMA21 {e21:,.2f} (momentum turun)")
+    else:
+        reasons.append(f"EMA9 {e9:,.2f} ≈ EMA21 {e21:,.2f} (belum ada momentum)")
     if rsi < 30:
         score += 8
         reasons.append(f"RSI {rsi} oversold → pantulan naik")
@@ -107,18 +112,23 @@ def vibe_analyze(history: list[dict], spot: float) -> dict:
         reasons.append(f"RSI {rsi} overbought → rawan koreksi")
     else:
         reasons.append(f"RSI {rsi} netral")
-    if macd["hist"] > 0:
+    if macd["hist"] > amb:
         score += 7
         reasons.append(f"MACD hist {macd['hist']:+} bullish")
-    else:
+    elif macd["hist"] < -amb:
         score -= 7
         reasons.append(f"MACD hist {macd['hist']:+} bearish")
-    if spot > bb["mid"]:
+    else:
+        reasons.append(f"MACD hist {macd['hist']:+} datar")
+    amb_bb = max((bb["upper"] - bb["lower"]) * 0.05, 1e-9)
+    if spot - bb["mid"] > amb_bb:
         score += 4
         reasons.append("Harga di atas BB-mid (bias beli)")
-    else:
+    elif bb["mid"] - spot > amb_bb:
         score -= 4
         reasons.append("Harga di bawah BB-mid (bias jual)")
+    else:
+        reasons.append("Harga di sekitar BB-mid (netral)")
     score = max(0, min(100, round(score, 1)))
     bias = "BUY" if score >= 55 else ("SELL" if score <= 45 else "NETRAL")
     return {"engine": "vibe-trading", "bias": bias, "score_0_100": score,
